@@ -6,10 +6,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use soroban_sdk::xdr::{
-    Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerEntry, LedgerKey, Limits,
-    Memo, MuxedAccount, Operation, OperationBody, Preconditions, ReadXdr, ScAddress, ScSymbol,
-    ScVal, SequenceNumber, SorobanAuthorizationEntry, SorobanTransactionData, Transaction,
-    TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    AccountId, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerEntry, LedgerKey,
+    Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ReadXdr,
+    ScAddress, ScSymbol, ScVal, SequenceNumber, SorobanAuthorizationEntry, SorobanTransactionData,
+    Transaction, TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -47,6 +47,9 @@ pub enum SimulationError {
 
     #[error("XDR decode error: {0}")]
     XdrError(String),
+
+    #[error("Invalid contract: {0}")]
+    InvalidContract(String),
 
     #[error("Parse error: {0}")]
     ParseError(#[from] crate::parser::ParserError),
@@ -816,19 +819,16 @@ impl SimulationEngine {
         Ok(BASE64.encode(&xdr_bytes))
     }
 
-    fn parse_contract_id(&self, contract_id: &str) -> Result<[u8; 32], SimulationError> {
-        if !contract_id.starts_with('C') {
-            return Err(SimulationError::NodeError(
-                "Contract ID must start with 'C'".to_string(),
-            ));
-        }
+    /// Parse a contract ID from strkey format (C...) to raw bytes
+    pub fn parse_contract_id(&self, contract_id: &str) -> Result<[u8; 32], SimulationError> {
         let strkey = Strkey::from_string(contract_id).map_err(|e| {
             SimulationError::NodeError(format!("Invalid contract ID format: {}", e))
         })?;
         match strkey {
             Strkey::Contract(contract) => Ok(contract.0),
-            _ => Err(SimulationError::NodeError(
-                "Expected contract address".to_string(),
+            _ => Err(SimulationError::InvalidContract(
+                "Contract ID must be a C... address".to_string(),
+            )),
             )),
         }
     }

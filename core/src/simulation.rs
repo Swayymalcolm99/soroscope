@@ -6,19 +6,17 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use soroban_sdk::xdr::{
-    AccountId, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerEntry, LedgerKey,
-    Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ReadXdr,
-    ScAddress, ScSymbol, ScVal, SequenceNumber, SorobanAuthorizationEntry, SorobanTransactionData,
-    Transaction, TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerEntry, LedgerKey, Limits,
+    Memo, MuxedAccount, Operation, OperationBody, Preconditions, ReadXdr, ScAddress, ScSymbol,
+    ScVal, SequenceNumber, SorobanAuthorizationEntry, SorobanTransactionData, Transaction,
+    TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stellar_strkey::Strkey;
 use thiserror::Error;
-use tokio::fs;
 use utoipa::ToSchema;
 
 /// Errors that can occur during simulation
@@ -829,7 +827,6 @@ impl SimulationEngine {
             _ => Err(SimulationError::InvalidContract(
                 "Contract ID must be a C... address".to_string(),
             )),
-            )),
         }
     }
 
@@ -1274,6 +1271,7 @@ mod tests {
                 latest_ledger: 42,
                 cost_stroops: 10,
                 state_dependency: None,
+                transaction_data: "AAA=".to_string(),
             }
         }
 

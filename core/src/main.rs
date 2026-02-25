@@ -199,9 +199,9 @@ fn default_safety_margin() -> f64 {
 
 #[derive(Serialize, ToSchema)]
 pub struct OptimizeLimitsResponse {
-    pub cpu: soroscope_core::simulation::OptimizationBuffer,
-    pub ram: soroscope_core::simulation::OptimizationBuffer,
-    pub recommended: soroscope_core::simulation::SorobanResources,
+    pub cpu: crate::simulation::OptimizationBuffer,
+    pub ram: crate::simulation::OptimizationBuffer,
+    pub recommended: crate::simulation::SorobanResources,
 }
 
 /// Convert a `SimulationResult` (library type) into the API `ResourceReport`.
@@ -341,8 +341,8 @@ async fn optimize_limits(
         OptimizeLimitsRequest, OptimizeLimitsResponse,
         auth::ChallengeRequest, auth::ChallengeResponse,
         auth::VerifyRequest, auth::VerifyResponse,
-        soroscope_core::simulation::OptimizationBuffer,
-        soroscope_core::simulation::SorobanResources
+        crate::simulation::OptimizationBuffer,
+        crate::simulation::SorobanResources
     )),
     tags(
         (name = "Analysis", description = "Soroban contract resource analysis endpoints"),

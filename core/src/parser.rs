@@ -15,11 +15,6 @@ pub enum ParserError {
         expected: String,
         found: String,
     },
-    InvalidType {
-        location: String,
-        expected: String,
-        found: String,
-    },
 
     #[error("Invalid symbol at {location}: {details}")]
     InvalidSymbol { location: String, details: String },

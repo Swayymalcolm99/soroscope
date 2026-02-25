@@ -179,6 +179,31 @@ pub struct StateDependencyReport {
     pub source: String,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct OptimizeLimitsRequest {
+    #[schema(example = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC")]
+    pub contract_id: String,
+    #[schema(example = "hello")]
+    pub function_name: String,
+    #[schema(example = "[]")]
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[schema(example = 0.05)]
+    #[serde(default = "default_safety_margin")]
+    pub safety_margin: f64,
+}
+
+fn default_safety_margin() -> f64 {
+    0.05
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct OptimizeLimitsResponse {
+    pub cpu: crate::simulation::OptimizationBuffer,
+    pub ram: crate::simulation::OptimizationBuffer,
+    pub recommended: crate::simulation::SorobanResources,
+}
+
 /// Convert a `SimulationResult` (library type) into the API `ResourceReport`.
 fn to_report(result: &SimulationResult, insights_engine: &InsightsEngine) -> ResourceReport {
     let insights_report = insights_engine.analyze(&result.resources);
@@ -270,13 +295,54 @@ async fn analyze(
     Ok((headers, Json(to_report(&result, &state.insights_engine))))
 }
 
+#[utoipa::path(
+    post,
+    path = "/analyze/optimize-limits",
+    request_body = OptimizeLimitsRequest,
+    responses(
+        (status = 200, description = "Resource optimization successful", body = OptimizeLimitsResponse),
+        (status = 500, description = "Optimization failed")
+    ),
+    tag = "Analysis"
+)]
+async fn optimize_limits(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<OptimizeLimitsRequest>,
+) -> Result<Json<OptimizeLimitsResponse>, AppError> {
+    tracing::info!(
+        "Optimizing limits for contract: {}, function: {}",
+        payload.contract_id,
+        payload.function_name
+    );
+
+    let report = state
+        .engine
+        .optimize_limits(
+            &payload.contract_id,
+            &payload.function_name,
+            payload.args,
+            payload.safety_margin,
+        )
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(OptimizeLimitsResponse {
+        cpu: report.cpu,
+        ram: report.ram,
+        recommended: report.recommended,
+    }))
+}
+
 #[derive(OpenApi)]
 #[openapi(
-    paths(analyze, auth::challenge_handler, auth::verify_handler),
+    paths(analyze, optimize_limits, auth::challenge_handler, auth::verify_handler),
     components(schemas(
         AnalyzeRequest, ResourceReport,
+        OptimizeLimitsRequest, OptimizeLimitsResponse,
         auth::ChallengeRequest, auth::ChallengeResponse,
-        auth::VerifyRequest, auth::VerifyResponse
+        auth::VerifyRequest, auth::VerifyResponse,
+        crate::simulation::OptimizationBuffer,
+        crate::simulation::SorobanResources
     )),
     tags(
         (name = "Analysis", description = "Soroban contract resource analysis endpoints"),
@@ -382,6 +448,7 @@ async fn main() {
 
     let protected = Router::new()
         .route("/analyze", post(analyze))
+        .route("/analyze/optimize-limits", post(optimize_limits))
         .route_layer(middleware::from_fn(auth::auth_middleware));
 
     let app = Router::new()

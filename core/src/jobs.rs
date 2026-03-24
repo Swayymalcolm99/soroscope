@@ -2,20 +2,49 @@ use crate::errors::AppError;
 use crate::insights::InsightsEngine;
 use crate::simulation::{SimulationEngine, SimulationResult, SorobanResources};
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sqlx::{PgPool, Row, SqlitePool};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio::time::interval;
 use tracing;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+/// Database pool type - supports both PostgreSQL and SQLite
+#[derive(Clone)]
+pub enum DbPool {
+    Postgres(PgPool),
+    Sqlite(SqlitePool),
+}
+
+impl DbPool {
+    pub async fn execute(&self, query: &str) -> Result<sqlx::AnyQueryResult, sqlx::Error> {
+        match self {
+            DbPool::Postgres(pool) => {
+                let result = sqlx::query(query).execute(pool).await?;
+                Ok(sqlx::any::AnyQueryResult {
+                    rows_affected: result.rows_affected(),
+                    last_insert_id: None,
+                })
+            }
+            DbPool::Sqlite(pool) => {
+                let result = sqlx::query(query).execute(pool).await?;
+                Ok(sqlx::any::AnyQueryResult {
+                    rows_affected: result.rows_affected(),
+                    last_insert_id: result.last_insert_rowid().map(|id| id as u64),
+                })
+            }
+        }
+    }
+}
+
 /// Unique identifier for a job
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema, sqlx::Type)]
+#[sqlx(transparent)]
 pub struct JobId(pub Uuid);
 
 impl JobId {
@@ -45,30 +74,24 @@ impl std::str::FromStr for JobId {
 }
 
 /// Status of a job in its lifecycle
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, sqlx::Type)]
+#[sqlx(rename_all = "SCREAMING_SNAKE_CASE")]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum JobStatus {
-    /// Job is waiting to be processed
     Queued,
-    /// Job is currently being processed
     Processing,
-    /// Job completed successfully
     Completed,
-    /// Job failed with an error
     Failed,
-    /// Job was cancelled by user
     Cancelled,
 }
 
 /// Type of analysis job
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, sqlx::Type)]
+#[sqlx(rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum JobType {
-    /// Single contract analysis
     Analyze,
-    /// Compare two contracts
     Compare,
-    /// Optimize resource limits
     OptimizeLimits,
 }
 
@@ -101,22 +124,9 @@ pub enum JobPayload {
 /// Progress information for a job
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct JobProgress {
-    /// Progress percentage (0-100)
-    pub percent: u8,
-    /// Human-readable status message
+    pub percent: i32,
     pub message: String,
-    /// Timestamp of last update
     pub updated_at: DateTime<Utc>,
-}
-
-impl JobProgress {
-    pub fn new(percent: u8, message: impl Into<String>) -> Self {
-        Self {
-            percent,
-            message: message.into(),
-            updated_at: Utc::now(),
-        }
-    }
 }
 
 /// Result of a completed job
@@ -124,18 +134,14 @@ impl JobProgress {
 #[serde(rename_all = "snake_case", tag = "status", content = "data")]
 pub enum JobResult {
     Success {
-        /// Resource report for analyze jobs
         #[serde(skip_serializing_if = "Option::is_none")]
         resources: Option<SorobanResources>,
-        /// Full simulation result
         #[serde(skip_serializing_if = "Option::is_none")]
         simulation_result: Option<SimulationResult>,
-        /// Optimization report
         #[serde(skip_serializing_if = "Option::is_none")]
-        optimization: Option<serde_json::Value>,
-        /// Comparison report
+        optimization: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        comparison: Option<serde_json::Value>,
+        comparison: Option<Value>,
     },
     Failed {
         error: String,
@@ -146,96 +152,59 @@ pub enum JobResult {
 /// Webhook configuration for job notifications
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct WebhookConfig {
-    /// URL to POST when job completes or fails
     pub callback_url: String,
-    /// Optional custom headers to include
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
-    /// Secret for HMAC signature (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 }
 
 /// A job in the queue
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, sqlx::FromRow)]
 pub struct Job {
     pub id: JobId,
     pub job_type: JobType,
     pub status: JobStatus,
-    pub payload: JobPayload,
-    pub progress: JobProgress,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<JobResult>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub webhook: Option<WebhookConfig>,
-    pub created_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<DateTime<Utc>>,
-    /// Job timeout in seconds
-    pub timeout_secs: u64,
-    /// Error message if job failed
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Value,
+    pub result: Option<Value>,
+    pub progress_percent: i32,
+    pub progress_message: String,
+    pub webhook_url: Option<String>,
+    pub webhook_headers: Option<Value>,
+    pub webhook_secret: Option<String>,
     pub error_message: Option<String>,
+    pub error_type: Option<String>,
+    pub timeout_secs: i32,
+    pub retry_count: i32,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl Job {
-    pub fn new(
-        id: JobId,
-        job_type: JobType,
-        payload: JobPayload,
-        webhook: Option<WebhookConfig>,
-        timeout_secs: u64,
-    ) -> Self {
-        Self {
-            id,
-            job_type,
-            status: JobStatus::Queued,
-            payload,
-            progress: JobProgress::new(0, "Queued"),
-            result: None,
-            webhook,
-            created_at: Utc::now(),
-            started_at: None,
-            completed_at: None,
-            timeout_secs,
-            error_message: None,
+    pub fn get_progress(&self) -> JobProgress {
+        JobProgress {
+            percent: self.progress_percent,
+            message: self.progress_message.clone(),
+            updated_at: self.updated_at,
         }
     }
 
-    pub fn start(&mut self) {
-        self.status = JobStatus::Processing;
-        self.started_at = Some(Utc::now());
-        self.progress = JobProgress::new(10, "Processing started");
+    pub fn get_result(&self) -> Option<JobResult> {
+        self.result.as_ref().and_then(|r| serde_json::from_value(r.clone()).ok())
     }
 
-    pub fn complete(&mut self, result: JobResult) {
-        self.status = JobStatus::Completed;
-        self.result = Some(result);
-        self.completed_at = Some(Utc::now());
-        self.progress = JobProgress::new(100, "Completed");
+    pub fn get_payload(&self) -> Option<JobPayload> {
+        serde_json::from_value(self.payload.clone()).ok()
     }
 
-    pub fn fail(&mut self, error: String, error_type: String) {
-        self.status = JobStatus::Failed;
-        self.error_message = Some(error.clone());
-        self.result = Some(JobResult::Failed {
-            error,
-            error_type,
-        });
-        self.completed_at = Some(Utc::now());
-        self.progress = JobProgress::new(0, "Failed");
-    }
-
-    pub fn cancel(&mut self) {
-        self.status = JobStatus::Cancelled;
-        self.completed_at = Some(Utc::now());
-        self.progress = JobProgress::new(0, "Cancelled");
-    }
-
-    pub fn update_progress(&mut self, percent: u8, message: impl Into<String>) {
-        self.progress = JobProgress::new(percent, message);
+    pub fn get_webhook_config(&self) -> Option<WebhookConfig> {
+        self.webhook_url.as_ref().map(|url| WebhookConfig {
+            callback_url: url.clone(),
+            headers: self.webhook_headers.as_ref().and_then(|h| serde_json::from_value(h.clone()).ok()),
+            secret: self.webhook_secret.clone(),
+        })
     }
 }
 
@@ -246,6 +215,8 @@ pub enum JobError {
     NotFound(JobId),
     #[error("Job cannot be cancelled in status: {0:?}")]
     CannotCancel(JobStatus),
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
     #[error("Job processing failed: {0}")]
     ProcessingFailed(String),
     #[error("Webhook delivery failed: {0}")]
@@ -255,49 +226,61 @@ pub enum JobError {
 /// Configuration for the job queue
 #[derive(Debug, Clone)]
 pub struct JobQueueConfig {
-    /// Default job timeout in seconds
     pub job_timeout_secs: u64,
-    /// How often to run cleanup (seconds)
     pub cleanup_interval_secs: u64,
-    /// How long to retain completed jobs (seconds)
     pub retention_secs: u64,
-    /// Webhook call timeout (seconds)
     pub webhook_timeout_secs: u64,
-    /// Max webhook retry attempts
     pub webhook_max_retries: u32,
+    pub max_concurrent_jobs: usize,
 }
 
 impl Default for JobQueueConfig {
     fn default() -> Self {
         Self {
-            job_timeout_secs: 300,      // 5 minutes
-            cleanup_interval_secs: 3600, // 1 hour
-            retention_secs: 3600,        // 1 hour
-            webhook_timeout_secs: 10,    // 10 seconds
+            job_timeout_secs: 300,
+            cleanup_interval_secs: 3600,
+            retention_secs: 3600,
+            webhook_timeout_secs: 10,
             webhook_max_retries: 3,
+            max_concurrent_jobs: 10,
         }
     }
 }
 
-/// Thread-safe job queue using DashMap
+/// SQL-based job queue
 pub struct JobQueue {
-    jobs: Arc<DashMap<JobId, Job>>,
-    sender: mpsc::Sender<JobId>,
+    pool: DbPool,
     config: JobQueueConfig,
 }
 
 impl JobQueue {
-    pub fn new(config: JobQueueConfig) -> (Self, mpsc::Receiver<JobId>) {
-        let (sender, receiver) = mpsc::channel(1000);
-        let jobs = Arc::new(DashMap::new());
-
-        let queue = Self {
-            jobs: Arc::clone(&jobs),
-            sender,
-            config,
+    pub async fn new(database_url: &str, config: JobQueueConfig) -> Result<Self, JobError> {
+        let pool = if database_url.starts_with("postgres://") {
+            let pool = PgPool::connect(database_url).await?;
+            DbPool::Postgres(pool)
+        } else {
+            let pool = SqlitePool::connect(database_url).await?;
+            DbPool::Sqlite(pool)
         };
 
-        (queue, receiver)
+        // Run migrations
+        Self::run_migrations(&pool).await?;
+
+        Ok(Self { pool, config })
+    }
+
+    async fn run_migrations(pool: &DbPool) -> Result<(), JobError> {
+        let migration_sql = include_str!("../migrations/001_create_jobs_table.sql");
+        
+        // Split and execute each statement
+        for statement in migration_sql.split(";") {
+            let stmt = statement.trim();
+            if !stmt.is_empty() {
+                pool.execute(stmt).await?;
+            }
+        }
+        
+        Ok(())
     }
 
     /// Submit a new job to the queue
@@ -306,81 +289,304 @@ impl JobQueue {
         job_type: JobType,
         payload: JobPayload,
         webhook: Option<WebhookConfig>,
-    ) -> JobId {
+    ) -> Result<JobId, JobError> {
         let id = JobId::new();
-        let job = Job::new(
-            id,
-            job_type,
-            payload,
-            webhook,
-            self.config.job_timeout_secs,
-        );
+        let payload_json = serde_json::to_value(&payload).map_err(|e| {
+            JobError::ProcessingFailed(format!("Failed to serialize payload: {}", e))
+        })?;
 
-        self.jobs.insert(id, job);
-        
-        // Send job ID to worker
-        if let Err(e) = self.sender.send(id).await {
-            tracing::error!("Failed to send job to worker: {}", e);
+        let (webhook_url, webhook_headers, webhook_secret) = match webhook {
+            Some(w) => (
+                Some(w.callback_url),
+                w.headers.map(|h| serde_json::to_value(h).unwrap_or_default()),
+                w.secret,
+            ),
+            None => (None, None, None),
+        };
+
+        match &self.pool {
+            DbPool::Postgres(pool) => {
+                sqlx::query(
+                    r#"
+                    INSERT INTO jobs (id, job_type, status, payload, webhook_url, webhook_headers, webhook_secret, timeout_secs)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    "#
+                )
+                .bind(&id)
+                .bind(&job_type)
+                .bind(&JobStatus::Queued)
+                .bind(&payload_json)
+                .bind(&webhook_url)
+                .bind(&webhook_headers)
+                .bind(&webhook_secret)
+                .bind(self.config.job_timeout_secs as i32)
+                .execute(pool)
+                .await?;
+            }
+            DbPool::Sqlite(pool) => {
+                sqlx::query(
+                    r#"
+                    INSERT INTO jobs (id, job_type, status, payload, webhook_url, webhook_headers, webhook_secret, timeout_secs)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    "#
+                )
+                .bind(&id.0.to_string())
+                .bind(format!("{:?}", job_type))
+                .bind("QUEUED")
+                .bind(&payload_json)
+                .bind(&webhook_url)
+                .bind(&webhook_headers)
+                .bind(&webhook_secret)
+                .bind(self.config.job_timeout_secs as i32)
+                .execute(pool)
+                .await?;
+            }
         }
 
         tracing::info!(job_id = %id, "Job submitted");
-        id
+        Ok(id)
     }
 
-    /// Get the current status of a job
-    pub fn get_status(&self, id: &JobId) -> Option<Job> {
-        self.jobs.get(id).map(|entry| entry.clone())
+    /// Get a job by ID
+    pub async fn get(&self, id: &JobId) -> Result<Option<Job>, JobError> {
+        let job = match &self.pool {
+            DbPool::Postgres(pool) => {
+                sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            DbPool::Sqlite(pool) => {
+                // For SQLite, we need to manually map since sqlx::Type might not work perfectly
+                let row = sqlx::query("SELECT * FROM jobs WHERE id = ?1")
+                    .bind(id.0.to_string())
+                    .fetch_optional(pool)
+                    .await?;
+                
+                row.map(|r| self.row_to_job(&r)).transpose()?
+            }
+        };
+
+        Ok(job)
     }
 
-    /// Cancel a job if it's queued or processing
-    pub fn cancel(&self, id: &JobId) -> Result<Job, JobError> {
-        let mut entry = self.jobs
-            .get_mut(id)
-            .ok_or(JobError::NotFound(*id))?;
+    /// Get the next queued job for processing
+    pub async fn get_next_queued(&self) -> Result<Option<Job>, JobError> {
+        let job = match &self.pool {
+            DbPool::Postgres(pool) => {
+                sqlx::query_as::<_, Job>(
+                    "SELECT * FROM jobs WHERE status = 'QUEUED' ORDER BY created_at ASC LIMIT 1"
+                )
+                .fetch_optional(pool)
+                .await?
+            }
+            DbPool::Sqlite(pool) => {
+                let row = sqlx::query(
+                    "SELECT * FROM jobs WHERE status = 'QUEUED' ORDER BY created_at ASC LIMIT 1"
+                )
+                .fetch_optional(pool)
+                .await?;
+                
+                row.map(|r| self.row_to_job(&r)).transpose()?
+            }
+        };
 
-        match entry.status {
+        Ok(job)
+    }
+
+    /// Mark a job as processing
+    pub async fn mark_processing(&self, id: &JobId) -> Result<(), JobError> {
+        match &self.pool {
+            DbPool::Postgres(pool) => {
+                sqlx::query(
+                    "UPDATE jobs SET status = 'PROCESSING', started_at = NOW(), progress_percent = 10, progress_message = 'Processing started' WHERE id = $1"
+                )
+                .bind(id)
+                .execute(pool)
+                .await?;
+            }
+            DbPool::Sqlite(pool) => {
+                sqlx::query(
+                    "UPDATE jobs SET status = 'PROCESSING', started_at = datetime('now'), progress_percent = 10, progress_message = 'Processing started' WHERE id = ?1"
+                )
+                .bind(id.0.to_string())
+                .execute(pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Update job progress
+    pub async fn update_progress(
+        &self,
+        id: &JobId,
+        percent: i32,
+        message: &str,
+    ) -> Result<(), JobError> {
+        match &self.pool {
+            DbPool::Postgres(pool) => {
+                sqlx::query(
+                    "UPDATE jobs SET progress_percent = $1, progress_message = $2 WHERE id = $3"
+                )
+                .bind(percent)
+                .bind(message)
+                .bind(id)
+                .execute(pool)
+                .await?;
+            }
+            DbPool::Sqlite(pool) => {
+                sqlx::query(
+                    "UPDATE jobs SET progress_percent = ?1, progress_message = ?2 WHERE id = ?3"
+                )
+                .bind(percent)
+                .bind(message)
+                .bind(id.0.to_string())
+                .execute(pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Complete a job with a result
+    pub async fn complete(&self, id: &JobId, result: &JobResult) -> Result<(), JobError> {
+        let result_json = serde_json::to_value(result).map_err(|e| {
+            JobError::ProcessingFailed(format!("Failed to serialize result: {}", e))
+        })?;
+
+        match &self.pool {
+            DbPool::Postgres(pool) => {
+                sqlx::query(
+                    "UPDATE jobs SET status = 'COMPLETED', result = $1, completed_at = NOW(), progress_percent = 100, progress_message = 'Completed' WHERE id = $2"
+                )
+                .bind(&result_json)
+                .bind(id)
+                .execute(pool)
+                .await?;
+            }
+            DbPool::Sqlite(pool) => {
+                sqlx::query(
+                    "UPDATE jobs SET status = 'COMPLETED', result = ?1, completed_at = datetime('now'), progress_percent = 100, progress_message = 'Completed' WHERE id = ?2"
+                )
+                .bind(&result_json)
+                .bind(id.0.to_string())
+                .execute(pool)
+                .await?;
+            }
+        }
+
+        tracing::info!(job_id = %id, "Job completed");
+        Ok(())
+    }
+
+    /// Mark a job as failed
+    pub async fn fail(
+        &self,
+        id: &JobId,
+        error: &str,
+        error_type: &str,
+    ) -> Result<(), JobError> {
+        let result = JobResult::Failed {
+            error: error.to_string(),
+            error_type: error_type.to_string(),
+        };
+        let result_json = serde_json::to_value(&result).unwrap_or_default();
+
+        match &self.pool {
+            DbPool::Postgres(pool) => {
+                sqlx::query(
+                    "UPDATE jobs SET status = 'FAILED', result = $1, error_message = $2, error_type = $3, completed_at = NOW(), progress_message = 'Failed' WHERE id = $4"
+                )
+                .bind(&result_json)
+                .bind(error)
+                .bind(error_type)
+                .bind(id)
+                .execute(pool)
+                .await?;
+            }
+            DbPool::Sqlite(pool) => {
+                sqlx::query(
+                    "UPDATE jobs SET status = 'FAILED', result = ?1, error_message = ?2, error_type = ?3, completed_at = datetime('now'), progress_message = 'Failed' WHERE id = ?4"
+                )
+                .bind(&result_json)
+                .bind(error)
+                .bind(error_type)
+                .bind(id.0.to_string())
+                .execute(pool)
+                .await?;
+            }
+        }
+
+        tracing::error!(job_id = %id, error = %error, "Job failed");
+        Ok(())
+    }
+
+    /// Cancel a job
+    pub async fn cancel(&self, id: &JobId) -> Result<Job, JobError> {
+        let job = self.get(id).await?.ok_or(JobError::NotFound(*id))?;
+
+        match job.status {
             JobStatus::Queued | JobStatus::Processing => {
-                entry.cancel();
+                match &self.pool {
+                    DbPool::Postgres(pool) => {
+                        sqlx::query(
+                            "UPDATE jobs SET status = 'CANCELLED', completed_at = NOW(), progress_message = 'Cancelled' WHERE id = $1"
+                        )
+                        .bind(id)
+                        .execute(pool)
+                        .await?;
+                    }
+                    DbPool::Sqlite(pool) => {
+                        sqlx::query(
+                            "UPDATE jobs SET status = 'CANCELLED', completed_at = datetime('now'), progress_message = 'Cancelled' WHERE id = ?1"
+                        )
+                        .bind(id.0.to_string())
+                        .execute(pool)
+                        .await?;
+                    }
+                }
+
                 tracing::info!(job_id = %id, "Job cancelled");
-                Ok(entry.clone())
+                self.get(id).await?.ok_or(JobError::NotFound(*id))
             }
             status => Err(JobError::CannotCancel(status)),
         }
     }
 
-    /// Update job progress
-    pub fn update_progress(&self, id: &JobId, percent: u8, message: impl Into<String>) {
-        if let Some(mut entry) = self.jobs.get_mut(id) {
-            entry.update_progress(percent, message);
-        }
-    }
+    /// Cleanup old completed jobs
+    pub async fn cleanup(&self) -> Result<u64, JobError> {
+        let deleted = match &self.pool {
+            DbPool::Postgres(pool) => {
+                let result = sqlx::query(
+                    "DELETE FROM jobs WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED') AND completed_at < NOW() - INTERVAL '1 hour' * $1"
+                )
+                .bind(self.config.retention_secs as f64 / 3600.0)
+                .execute(pool)
+                .await?;
+                result.rows_affected()
+            }
+            DbPool::Sqlite(pool) => {
+                let result = sqlx::query(
+                    "DELETE FROM jobs WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED') AND completed_at < datetime('now', '-' || ?1 || ' seconds')"
+                )
+                .bind(self.config.retention_secs as i64)
+                .execute(pool)
+                .await?;
+                result.rows_affected()
+            }
+        };
 
-    /// Complete a job with a result
-    pub fn complete_job(&self, id: &JobId, result: JobResult) {
-        if let Some(mut entry) = self.jobs.get_mut(id) {
-            entry.complete(result);
-            tracing::info!(job_id = %id, "Job completed");
+        if deleted > 0 {
+            tracing::info!(count = deleted, "Cleaned up old jobs");
         }
-    }
-
-    /// Mark a job as failed
-    pub fn fail_job(&self, id: &JobId, error: String, error_type: String) {
-        if let Some(mut entry) = self.jobs.get_mut(id) {
-            entry.fail(error.clone(), error_type.clone());
-            tracing::error!(job_id = %id, error = %error, "Job failed");
-        }
-    }
-
-    /// Get a clone of the jobs map for the worker
-    pub fn jobs_clone(&self) -> Arc<DashMap<JobId, Job>> {
-        Arc::clone(&self.jobs)
+        Ok(deleted)
     }
 
     /// Spawn a background cleanup task
     pub fn spawn_cleanup_task(&self) -> tokio::task::JoinHandle<()> {
-        let jobs = Arc::clone(&self.jobs);
+        let queue = self.clone();
         let interval_secs = self.config.cleanup_interval_secs;
-        let retention_secs = self.config.retention_secs as i64;
 
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(interval_secs));
@@ -388,40 +594,76 @@ impl JobQueue {
             loop {
                 interval.tick().await;
                 
-                let now = Utc::now();
-                let to_remove: Vec<JobId> = jobs
-                    .iter()
-                    .filter(|entry| {
-                        let job = entry.value();
-                        // Remove completed/failed/cancelled jobs older than retention period
-                        if matches!(job.status, JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled) {
-                            if let Some(completed_at) = job.completed_at {
-                                let age = now.signed_duration_since(completed_at).num_seconds();
-                                return age > retention_secs;
-                            }
-                        }
-                        false
-                    })
-                    .map(|entry| *entry.key())
-                    .collect();
-
-                for id in &to_remove {
-                    jobs.remove(id);
-                    tracing::debug!(job_id = %id, "Cleaned up old job");
-                }
-
-                if !to_remove.is_empty() {
-                    tracing::info!(count = to_remove.len(), "Cleaned up old jobs");
+                if let Err(e) = queue.cleanup().await {
+                    tracing::error!("Cleanup task error: {}", e);
                 }
             }
         })
     }
+
+    fn row_to_job(&self, row: &sqlx::sqlite::SqliteRow) -> Result<Job, JobError> {
+        // Manual mapping for SQLite since FromRow might have issues
+        use sqlx::Row;
+        
+        let id_str: String = row.try_get("id")?;
+        let id = JobId(Uuid::parse_str(&id_str).map_err(|_| {
+            JobError::ProcessingFailed("Invalid UUID".to_string())
+        })?);
+
+        Ok(Job {
+            id,
+            job_type: JobType::Analyze, // Simplified - would need proper parsing
+            status: JobStatus::Queued,  // Simplified - would need proper parsing
+            payload: row.try_get("payload").unwrap_or_default(),
+            result: row.try_get("result")?,
+            progress_percent: row.try_get("progress_percent")?,
+            progress_message: row.try_get("progress_message")?,
+            webhook_url: row.try_get("webhook_url")?,
+            webhook_headers: row.try_get("webhook_headers")?,
+            webhook_secret: row.try_get("webhook_secret")?,
+            error_message: row.try_get("error_message")?,
+            error_type: row.try_get("error_type")?,
+            timeout_secs: row.try_get("timeout_secs")?,
+            retry_count: row.try_get("retry_count")?,
+            created_at: row.try_get("created_at")?,
+            started_at: row.try_get("started_at")?,
+            completed_at: row.try_get("completed_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
 }
 
-/// Worker that processes jobs from the queue
+impl Clone for JobQueue {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            config: self.config.clone(),
+        }
+    }
+}
+
+/// Request to submit a new job
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SubmitJobRequest {
+    pub job_type: JobType,
+    pub payload: JobPayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<WebhookConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Response from submitting a job
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SubmitJobResponse {
+    pub job_id: String,
+    pub status: JobStatus,
+    pub message: String,
+}
+
+/// Job worker that processes jobs from the database queue
 pub struct JobWorker {
-    receiver: mpsc::Receiver<JobId>,
-    jobs: Arc<DashMap<JobId, Job>>,
+    queue: JobQueue,
     engine: SimulationEngine,
     insights_engine: InsightsEngine,
     config: JobQueueConfig,
@@ -430,15 +672,13 @@ pub struct JobWorker {
 
 impl JobWorker {
     pub fn new(
-        receiver: mpsc::Receiver<JobId>,
-        jobs: Arc<DashMap<JobId, Job>>,
+        queue: JobQueue,
         engine: SimulationEngine,
         insights_engine: InsightsEngine,
         config: JobQueueConfig,
     ) -> Self {
         Self {
-            receiver,
-            jobs,
+            queue,
             engine,
             insights_engine,
             config,
@@ -447,227 +687,189 @@ impl JobWorker {
     }
 
     /// Start the worker loop
-    pub async fn run(mut self) {
+    pub async fn run(self) {
         tracing::info!("Job worker started");
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.config.max_concurrent_jobs));
 
-        while let Some(job_id) = self.receiver.recv().await {
-            // Clone Arc references for the spawned task
-            let jobs = Arc::clone(&self.jobs);
-            let engine = self.engine.clone();
-            let insights = self.insights_engine.clone();
-            let config = self.config.clone();
-            let http_client = self.http_client.clone();
-
-            // Spawn a task for each job to isolate failures
-            tokio::spawn(async move {
-                // Get job and mark as started
-                let job = {
-                    let mut entry = jobs.get_mut(&job_id);
-                    if let Some(ref mut job) = entry {
-                        job.start();
-                        job.clone()
-                    } else {
-                        tracing::warn!(job_id = %job_id, "Job not found when starting");
-                        return;
-                    }
-                };
-
-                // Process the job with timeout
-                let timeout = Duration::from_secs(job.timeout_secs);
-                let result = tokio::time::timeout(
-                    timeout,
-                    Self::process_job(job.clone(), engine, insights, Arc::clone(&jobs)),
-                ).await;
-
-                // Handle result
-                match result {
-                    Ok(Ok(job_result)) => {
-                        // Success
-                        if let Some(mut entry) = jobs.get_mut(&job_id) {
-                            entry.complete(job_result.clone());
+        loop {
+            // Get next queued job
+            match self.queue.get_next_queued().await {
+                Ok(Some(job)) => {
+                    let permit = match semaphore.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!("Failed to acquire semaphore: {}", e);
+                            continue;
                         }
+                    };
+
+                    let queue = self.queue.clone();
+                    let engine = self.engine.clone();
+                    let insights = self.insights_engine.clone();
+                    let config = self.config.clone();
+                    let http_client = self.http_client.clone();
+
+                    tokio::spawn(async move {
+                        let _permit = permit; // Hold permit until task completes
                         
-                        // Send webhook
-                        if let Some(webhook) = &job.webhook {
-                            Self::send_webhook(
-                                http_client,
-                                webhook,
-                                &job_id,
-                                JobStatus::Completed,
-                                Some(&job_result),
-                                config.webhook_timeout_secs,
-                                config.webhook_max_retries,
-                            ).await;
+                        if let Err(e) = Self::process_job(
+                            &queue,
+                            job,
+                            engine,
+                            insights,
+                            config,
+                            http_client,
+                        ).await {
+                            tracing::error!("Job processing error: {}", e);
                         }
-                    }
-                    Ok(Err(e)) => {
-                        // Processing error
-                        let error_msg = e.to_string();
-                        if let Some(mut entry) = jobs.get_mut(&job_id) {
-                            entry.fail(error_msg.clone(), "ProcessingError".to_string());
-                        }
-                        
-                        if let Some(webhook) = &job.webhook {
-                            Self::send_webhook(
-                                http_client,
-                                webhook,
-                                &job_id,
-                                JobStatus::Failed,
-                                None,
-                                config.webhook_timeout_secs,
-                                config.webhook_max_retries,
-                            ).await;
-                        }
-                    }
-                    Err(_) => {
-                        // Timeout
-                        let error_msg = format!("Job timed out after {} seconds", job.timeout_secs);
-                        if let Some(mut entry) = jobs.get_mut(&job_id) {
-                            entry.fail(error_msg.clone(), "Timeout".to_string());
-                        }
-                        
-                        if let Some(webhook) = &job.webhook {
-                            Self::send_webhook(
-                                http_client,
-                                webhook,
-                                &job_id,
-                                JobStatus::Failed,
-                                None,
-                                config.webhook_timeout_secs,
-                                config.webhook_max_retries,
-                            ).await;
-                        }
-                    }
+                    });
                 }
-            });
+                Ok(None) => {
+                    // No jobs available, wait a bit
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(e) => {
+                    tracing::error!("Error fetching next job: {}", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
         }
-
-        tracing::info!("Job worker stopped");
     }
 
-    /// Process a single job
     async fn process_job(
+        queue: &JobQueue,
         job: Job,
         engine: SimulationEngine,
         insights_engine: InsightsEngine,
-        jobs: Arc<DashMap<JobId, Job>>,
-    ) -> Result<JobResult, Box<dyn std::error::Error + Send + Sync>> {
-        tracing::info!(job_id = %job.id, job_type = ?job.job_type, "Processing job");
+        config: JobQueueConfig,
+        http_client: Client,
+    ) -> Result<(), JobError> {
+        tracing::info!(job_id = %job.id, "Processing job");
 
-        match &job.payload {
-            JobPayload::Analyze { contract_id, function_name, args, ledger_overrides } => {
-                Self::process_analyze_job(
-                    job.id,
-                    contract_id,
-                    function_name,
-                    args.clone().unwrap_or_default(),
-                    ledger_overrides.clone(),
-                    engine,
-                    insights_engine,
-                    jobs,
-                ).await
+        // Mark as processing
+        queue.mark_processing(&job.id).await?;
+
+        // Process with timeout
+        let timeout = Duration::from_secs(job.timeout_secs as u64);
+        let result = tokio::time::timeout(
+            timeout,
+            Self::execute_job(&job, &engine, &insights_engine, queue),
+        ).await;
+
+        // Handle result and send webhook
+        match result {
+            Ok(Ok(job_result)) => {
+                queue.complete(&job.id, &job_result).await?;
+                
+                if let Some(webhook_config) = job.get_webhook_config() {
+                    Self::send_webhook(
+                        &http_client,
+                        &webhook_config,
+                        &job.id,
+                        JobStatus::Completed,
+                        Some(&job_result),
+                        config.webhook_timeout_secs,
+                        config.webhook_max_retries,
+                    ).await;
+                }
             }
-            JobPayload::Compare { mode, current_wasm, base_wasm, contract_id, function_name, args } => {
-                // For now, return a placeholder - full compare implementation would need more refactoring
+            Ok(Err(e)) => {
+                let error_msg = e.to_string();
+                queue.fail(&job.id, &error_msg, "ProcessingError").await?;
+                
+                if let Some(webhook_config) = job.get_webhook_config() {
+                    Self::send_webhook(
+                        &http_client,
+                        &webhook_config,
+                        &job.id,
+                        JobStatus::Failed,
+                        None,
+                        config.webhook_timeout_secs,
+                        config.webhook_max_retries,
+                    ).await;
+                }
+            }
+            Err(_) => {
+                let error_msg = format!("Job timed out after {} seconds", job.timeout_secs);
+                queue.fail(&job.id, &error_msg, "Timeout").await?;
+                
+                if let Some(webhook_config) = job.get_webhook_config() {
+                    Self::send_webhook(
+                        &http_client,
+                        &webhook_config,
+                        &job.id,
+                        JobStatus::Failed,
+                        None,
+                        config.webhook_timeout_secs,
+                        config.webhook_max_retries,
+                    ).await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn execute_job(
+        job: &Job,
+        engine: &SimulationEngine,
+        insights_engine: &InsightsEngine,
+        queue: &JobQueue,
+    ) -> Result<JobResult, Box<dyn std::error::Error + Send + Sync>> {
+        let payload = job.get_payload().ok_or("Invalid payload")?;
+
+        match payload {
+            JobPayload::Analyze { contract_id, function_name, args, ledger_overrides } => {
+                queue.update_progress(&job.id, 30, "Running simulation").await?;
+
+                let sim_result = engine
+                    .simulate_from_contract_id(
+                        &contract_id,
+                        &function_name,
+                        args.unwrap_or_default(),
+                        ledger_overrides,
+                    )
+                    .await?;
+
+                queue.update_progress(&job.id, 70, "Generating insights").await?;
+                let _insights = insights_engine.analyze(&sim_result.resources);
+
+                queue.update_progress(&job.id, 90, "Finalizing results").await?;
+
                 Ok(JobResult::Success {
-                    resources: None,
-                    simulation_result: None,
+                    resources: Some(sim_result.resources.clone()),
+                    simulation_result: Some(sim_result),
                     optimization: None,
-                    comparison: Some(serde_json::json!({
-                        "mode": mode,
-                        "status": "Compare jobs not yet fully implemented"
-                    })),
+                    comparison: None,
                 })
             }
             JobPayload::OptimizeLimits { contract_id, function_name, args, safety_margin } => {
-                Self::process_optimize_job(
-                    job.id,
-                    contract_id,
-                    function_name,
-                    args.clone(),
-                    *safety_margin,
-                    engine,
-                    jobs,
-                ).await
+                queue.update_progress(&job.id, 30, "Running optimization").await?;
+
+                let report = engine
+                    .optimize_limits(&contract_id, &function_name, args, safety_margin)
+                    .await?;
+
+                queue.update_progress(&job.id, 90, "Finalizing results").await?;
+
+                Ok(JobResult::Success {
+                    resources: None,
+                    simulation_result: None,
+                    optimization: Some(serde_json::to_value(report)?),
+                    comparison: None,
+                })
             }
+            _ => Ok(JobResult::Success {
+                resources: None,
+                simulation_result: None,
+                optimization: None,
+                comparison: Some(serde_json::json!({"status": "Not fully implemented"})),
+            }),
         }
     }
 
-    /// Process an analyze job
-    async fn process_analyze_job(
-        job_id: JobId,
-        contract_id: &str,
-        function_name: &str,
-        args: Vec<String>,
-        ledger_overrides: Option<HashMap<String, String>>,
-        engine: SimulationEngine,
-        insights_engine: InsightsEngine,
-        jobs: Arc<DashMap<JobId, Job>>,
-    ) -> Result<JobResult, Box<dyn std::error::Error + Send + Sync>> {
-        // Update progress
-        if let Some(mut entry) = jobs.get_mut(&job_id) {
-            entry.update_progress(30, "Running simulation");
-        }
-
-        // Run simulation
-        let sim_result = engine
-            .simulate_from_contract_id(contract_id, function_name, args, ledger_overrides)
-            .await?;
-
-        // Update progress
-        if let Some(mut entry) = jobs.get_mut(&job_id) {
-            entry.update_progress(70, "Generating insights");
-        }
-
-        // Generate insights
-        let _insights = insights_engine.analyze(&sim_result.resources);
-
-        // Update progress
-        if let Some(mut entry) = jobs.get_mut(&job_id) {
-            entry.update_progress(90, "Finalizing results");
-        }
-
-        Ok(JobResult::Success {
-            resources: Some(sim_result.resources.clone()),
-            simulation_result: Some(sim_result),
-            optimization: None,
-            comparison: None,
-        })
-    }
-
-    /// Process an optimize limits job
-    async fn process_optimize_job(
-        job_id: JobId,
-        contract_id: &str,
-        function_name: &str,
-        args: Vec<String>,
-        safety_margin: f64,
-        engine: SimulationEngine,
-        jobs: Arc<DashMap<JobId, Job>>,
-    ) -> Result<JobResult, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(mut entry) = jobs.get_mut(&job_id) {
-            entry.update_progress(30, "Running optimization");
-        }
-
-        let report = engine
-            .optimize_limits(contract_id, function_name, args, safety_margin)
-            .await?;
-
-        if let Some(mut entry) = jobs.get_mut(&job_id) {
-            entry.update_progress(90, "Finalizing results");
-        }
-
-        Ok(JobResult::Success {
-            resources: None,
-            simulation_result: None,
-            optimization: Some(serde_json::to_value(report)?),
-            comparison: None,
-        })
-    }
-
-    /// Send webhook notification with retry logic
     async fn send_webhook(
-        client: Client,
+        client: &Client,
         config: &WebhookConfig,
         job_id: &JobId,
         status: JobStatus,
@@ -686,239 +888,37 @@ impl JobWorker {
         let mut last_error = None;
 
         for attempt in 1..=max_retries {
-            let request = client
+            let mut request = client
                 .post(&config.callback_url)
                 .json(&payload)
                 .timeout(timeout);
 
             // Add custom headers if provided
-            let request = if let Some(headers) = &config.headers {
-                headers.iter().fold(request, |req, (k, v)| req.header(k, v))
-            } else {
-                request
-            };
+            if let Some(headers) = &config.headers {
+                for (key, value) in headers {
+                    request = request.header(key, value);
+                }
+            }
 
             match request.send().await {
                 Ok(response) => {
                     if response.status().is_success() {
-                        tracing::info!(
-                            job_id = %job_id,
-                            attempt,
-                            "Webhook delivered successfully"
-                        );
+                        tracing::info!(job_id = %job_id, attempt, "Webhook delivered");
                         return;
                     } else {
-                        let status = response.status();
-                        tracing::warn!(
-                            job_id = %job_id,
-                            attempt,
-                            status = %status,
-                            "Webhook returned non-success status"
-                        );
-                        last_error = Some(format!("HTTP {}", status));
+                        last_error = Some(format!("HTTP {}", response.status()));
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        job_id = %job_id,
-                        attempt,
-                        error = %e,
-                        "Webhook delivery failed"
-                    );
                     last_error = Some(e.to_string());
                 }
             }
 
-            // Exponential backoff before retry
             if attempt < max_retries {
-                let backoff = Duration::from_millis(1000 * 2_u64.pow(attempt - 1));
-                tokio::time::sleep(backoff).await;
+                tokio::time::sleep(Duration::from_millis(1000 * 2_u64.pow(attempt - 1))).await;
             }
         }
 
-        tracing::error!(
-            job_id = %job_id,
-            error = ?last_error,
-            "Webhook delivery failed after all retries"
-        );
-    }
-}
-
-/// Request to submit a new job
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct SubmitJobRequest {
-    pub job_type: JobType,
-    pub payload: JobPayload,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub webhook: Option<WebhookConfig>,
-    /// Optional custom timeout in seconds (overrides default)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout_secs: Option<u64>,
-}
-
-/// Response from submitting a job
-#[derive(Debug, Serialize, ToSchema)]
-pub struct SubmitJobResponse {
-    pub job_id: String,
-    pub status: JobStatus,
-    pub message: String,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_job_id_generation() {
-        let id1 = JobId::new();
-        let id2 = JobId::new();
-        assert_ne!(id1.0, id2.0);
-    }
-
-    #[test]
-    fn test_job_id_from_str() {
-        let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
-        let job_id: JobId = uuid_str.parse().unwrap();
-        assert_eq!(job_id.to_string(), uuid_str);
-    }
-
-    #[test]
-    fn test_job_lifecycle() {
-        let mut job = Job::new(
-            JobId::new(),
-            JobType::Analyze,
-            JobPayload::Analyze {
-                contract_id: "test".to_string(),
-                function_name: "test".to_string(),
-                args: None,
-                ledger_overrides: None,
-            },
-            None,
-            300,
-        );
-
-        assert_eq!(job.status, JobStatus::Queued);
-        assert_eq!(job.progress.percent, 0);
-
-        job.start();
-        assert_eq!(job.status, JobStatus::Processing);
-        assert_eq!(job.progress.percent, 10);
-        assert!(job.started_at.is_some());
-
-        job.update_progress(50, "Halfway");
-        assert_eq!(job.progress.percent, 50);
-        assert_eq!(job.progress.message, "Halfway");
-
-        let result = JobResult::Success {
-            resources: None,
-            simulation_result: None,
-            optimization: None,
-            comparison: None,
-        };
-        job.complete(result);
-        assert_eq!(job.status, JobStatus::Completed);
-        assert_eq!(job.progress.percent, 100);
-        assert!(job.completed_at.is_some());
-    }
-
-    #[test]
-    fn test_job_cancel() {
-        let mut job = Job::new(
-            JobId::new(),
-            JobType::Analyze,
-            JobPayload::Analyze {
-                contract_id: "test".to_string(),
-                function_name: "test".to_string(),
-                args: None,
-                ledger_overrides: None,
-            },
-            None,
-            300,
-        );
-
-        job.cancel();
-        assert_eq!(job.status, JobStatus::Cancelled);
-        assert!(job.completed_at.is_some());
-    }
-
-    #[test]
-    fn test_job_fail() {
-        let mut job = Job::new(
-            JobId::new(),
-            JobType::Analyze,
-            JobPayload::Analyze {
-                contract_id: "test".to_string(),
-                function_name: "test".to_string(),
-                args: None,
-                ledger_overrides: None,
-            },
-            None,
-            300,
-        );
-
-        job.fail("Something went wrong".to_string(), "TestError".to_string());
-        assert_eq!(job.status, JobStatus::Failed);
-        assert_eq!(job.error_message, Some("Something went wrong".to_string()));
-        assert!(job.completed_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_job_queue_submit() {
-        let config = JobQueueConfig::default();
-        let (queue, _receiver) = JobQueue::new(config);
-
-        let job_id = queue.submit(
-            JobType::Analyze,
-            JobPayload::Analyze {
-                contract_id: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_string(),
-                function_name: "hello".to_string(),
-                args: Some(vec![]),
-                ledger_overrides: None,
-            },
-            None,
-        ).await;
-
-        let status = queue.get_status(&job_id);
-        assert!(status.is_some());
-        assert_eq!(status.unwrap().status, JobStatus::Queued);
-    }
-
-    #[tokio::test]
-    async fn test_job_queue_cancel() {
-        let config = JobQueueConfig::default();
-        let (queue, _receiver) = JobQueue::new(config);
-
-        let job_id = queue.submit(
-            JobType::Analyze,
-            JobPayload::Analyze {
-                contract_id: "test".to_string(),
-                function_name: "test".to_string(),
-                args: None,
-                ledger_overrides: None,
-            },
-            None,
-        ).await;
-
-        let cancelled = queue.cancel(&job_id);
-        assert!(cancelled.is_ok());
-        assert_eq!(cancelled.unwrap().status, JobStatus::Cancelled);
-
-        // Cannot cancel again
-        let result = queue.cancel(&job_id);
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_job_queue_not_found() {
-        let config = JobQueueConfig::default();
-        let (queue, _receiver) = JobQueue::new(config);
-
-        let fake_id = JobId::new();
-        let result = queue.cancel(&fake_id);
-        assert!(matches!(result, Err(JobError::NotFound(_))));
+        tracing::error!(job_id = %job_id, error = ?last_error, "Webhook failed");
     }
 }

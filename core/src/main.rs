@@ -63,21 +63,15 @@ struct AppConfig {
     /// Simulation timeout in seconds (default 30).
     #[serde(default = "default_simulation_timeout_secs")]
     simulation_timeout_secs: u64,
+    /// Database URL for job queue (PostgreSQL or SQLite)
+    #[serde(default = "default_database_url")]
+    database_url: String,
     /// Job timeout in seconds (default 300).
     #[serde(default = "default_job_timeout_secs")]
     job_timeout_secs: u64,
-    /// Job cleanup interval in seconds (default 3600).
-    #[serde(default = "default_job_cleanup_interval_secs")]
-    job_cleanup_interval_secs: u64,
-    /// Job retention time after completion in seconds (default 3600).
-    #[serde(default = "default_job_retention_secs")]
-    job_retention_secs: u64,
-    /// Webhook timeout in seconds (default 10).
-    #[serde(default = "default_webhook_timeout_secs")]
-    webhook_timeout_secs: u64,
-    /// Max webhook retry attempts (default 3).
-    #[serde(default = "default_webhook_max_retries")]
-    webhook_max_retries: u32,
+    /// Max concurrent jobs (default 10).
+    #[serde(default = "default_max_concurrent_jobs")]
+    max_concurrent_jobs: usize,
 }
 
 fn default_health_check_interval() -> u64 {
@@ -88,24 +82,16 @@ fn default_simulation_timeout_secs() -> u64 {
     30
 }
 
+fn default_database_url() -> String {
+    "sqlite://soroscope.db".to_string()
+}
+
 fn default_job_timeout_secs() -> u64 {
-    300 // 5 minutes
+    300
 }
 
-fn default_job_cleanup_interval_secs() -> u64 {
-    3600 // 1 hour
-}
-
-fn default_job_retention_secs() -> u64 {
-    3600 // 1 hour
-}
-
-fn default_webhook_timeout_secs() -> u64 {
+fn default_max_concurrent_jobs() -> usize {
     10
-}
-
-fn default_webhook_max_retries() -> u32 {
-    3
 }
 
 fn load_config() -> Result<AppConfig, ConfigError> {
@@ -122,11 +108,9 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("rpc_providers", "")?
         .set_default("health_check_interval_secs", 30)?
         .set_default("simulation_timeout_secs", 30)?
+        .set_default("database_url", "sqlite://soroscope.db")?
         .set_default("job_timeout_secs", 300)?
-        .set_default("job_cleanup_interval_secs", 3600)?
-        .set_default("job_retention_secs", 3600)?
-        .set_default("webhook_timeout_secs", 10)?
-        .set_default("webhook_max_retries", 3)?
+        .set_default("max_concurrent_jobs", 10)?
         .build()?;
 
     settings.try_deserialize()
@@ -172,7 +156,7 @@ struct AppState {
     /// Simulation timeout for RPC requests
     simulation_timeout: std::time::Duration,
     /// Job queue for background task processing
-    job_queue: Arc<JobQueue>,
+    job_queue: JobQueue,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -575,117 +559,6 @@ async fn compare_handler(
     Ok(Json(CompareApiResponse { report }))
 }
 
-// ── Job handlers ─────────────────────────────────────────────────────────────
-
-#[utoipa::path(
-    post,
-    path = "/jobs/submit",
-    request_body = SubmitJobRequest,
-    responses(
-        (status = 200, description = "Job submitted successfully", body = SubmitJobResponse),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized")
-    ),
-    security(
-        ("jwt" = [])
-    ),
-    tag = "Jobs"
-)]
-async fn submit_job(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<SubmitJobRequest>,
-) -> Result<Json<SubmitJobResponse>, AppError> {
-    tracing::info!(job_type = ?payload.job_type, "Received job submission");
-
-    let job_id = state
-        .job_queue
-        .submit(payload.job_type, payload.payload, payload.webhook)
-        .await;
-
-    tracing::info!(job_id = %job_id, "Job submitted successfully");
-
-    Ok(Json(SubmitJobResponse {
-        job_id: job_id.to_string(),
-        status: crate::jobs::JobStatus::Queued,
-        message: "Job submitted successfully".to_string(),
-    }))
-}
-
-#[utoipa::path(
-    get,
-    path = "/jobs/{id}",
-    params(
-        ("id" = String, Path, description = "Job ID")
-    ),
-    responses(
-        (status = 200, description = "Job status retrieved", body = crate::jobs::Job),
-        (status = 404, description = "Job not found"),
-        (status = 401, description = "Unauthorized")
-    ),
-    security(
-        ("jwt" = [])
-    ),
-    tag = "Jobs"
-)]
-async fn get_job_status(
-    State(state): State<Arc<AppState>>,
-    Path(job_id): Path<String>,
-) -> Result<Json<crate::jobs::Job>, AppError> {
-    let id: JobId = job_id.parse().map_err(|_| {
-        AppError::BadRequest("Invalid job ID format".to_string())
-    })?;
-
-    let job = state
-        .job_queue
-        .get_status(&id)
-        .ok_or_else(|| AppError::NotFound(format!("Job not found: {}", job_id)))?;
-
-    Ok(Json(job))
-}
-
-#[utoipa::path(
-    post,
-    path = "/jobs/{id}/cancel",
-    params(
-        ("id" = String, Path, description = "Job ID")
-    ),
-    responses(
-        (status = 200, description = "Job cancelled", body = crate::jobs::Job),
-        (status = 400, description = "Cannot cancel job in current state"),
-        (status = 404, description = "Job not found"),
-        (status = 401, description = "Unauthorized")
-    ),
-    security(
-        ("jwt" = [])
-    ),
-    tag = "Jobs"
-)]
-async fn cancel_job(
-    State(state): State<Arc<AppState>>,
-    Path(job_id): Path<String>,
-) -> Result<Json<crate::jobs::Job>, AppError> {
-    let id: JobId = job_id.parse().map_err(|_| {
-        AppError::BadRequest("Invalid job ID format".to_string())
-    })?;
-
-    let job = state
-        .job_queue
-        .cancel(&id)
-        .map_err(|e| match e {
-            crate::jobs::JobError::NotFound(_) => {
-                AppError::NotFound(format!("Job not found: {}", job_id))
-            }
-            crate::jobs::JobError::CannotCancel(status) => {
-                AppError::BadRequest(format!("Cannot cancel job in status: {:?}", status))
-            }
-            _ => AppError::Internal(e.to_string()),
-        })?;
-
-    tracing::info!(job_id = %job_id, "Job cancelled");
-
-    Ok(Json(job))
-}
-
 /// Write WASM bytes to a temporary file and return the path.
 fn write_temp_wasm(bytes: &[u8]) -> Result<std::path::PathBuf, AppError> {
     use std::io::Write;
@@ -705,17 +578,12 @@ fn write_temp_wasm(bytes: &[u8]) -> Result<std::path::PathBuf, AppError> {
 #[openapi(
     paths(
         analyze, optimize_limits, compare_handler,
-        submit_job, get_job_status, cancel_job,
         auth::challenge_handler, auth::verify_handler
     ),
     components(schemas(
         AnalyzeRequest, ResourceReport,
         OptimizeLimitsRequest, OptimizeLimitsResponse,
         CompareApiResponse, RegressionReport, ResourceDelta, RegressionFlag,
-        SubmitJobRequest, SubmitJobResponse,
-        crate::jobs::Job, crate::jobs::JobId, crate::jobs::JobStatus,
-        crate::jobs::JobType, crate::jobs::JobPayload, crate::jobs::JobResult,
-        crate::jobs::JobProgress, crate::jobs::WebhookConfig,
         auth::ChallengeRequest, auth::ChallengeResponse,
         auth::VerifyRequest, auth::VerifyResponse,
         crate::simulation::OptimizationBuffer,
@@ -723,7 +591,6 @@ fn write_temp_wasm(bytes: &[u8]) -> Result<std::path::PathBuf, AppError> {
     )),
     tags(
         (name = "Analysis", description = "Soroban contract resource analysis endpoints"),
-        (name = "Jobs", description = "Background job queue for async analysis"),
         (name = "Auth", description = "SEP-10 wallet authentication")
     ),
     info(
@@ -867,39 +734,6 @@ async fn main() {
     let simulation_timeout = std::time::Duration::from_secs(config.simulation_timeout_secs);
     tracing::info!(timeout_secs = config.simulation_timeout_secs, "Simulation timeout configured");
 
-    // ── Job Queue setup ─────────────────────────────────────────────────
-    let job_queue_config = JobQueueConfig {
-        job_timeout_secs: config.job_timeout_secs,
-        cleanup_interval_secs: config.job_cleanup_interval_secs,
-        retention_secs: config.job_retention_secs,
-        webhook_timeout_secs: config.webhook_timeout_secs,
-        webhook_max_retries: config.webhook_max_retries,
-    };
-    
-    let (job_queue, job_receiver) = JobQueue::new(job_queue_config.clone());
-    let job_queue = Arc::new(job_queue);
-    
-    // Spawn job worker
-    let job_worker = JobWorker::new(
-        job_receiver,
-        job_queue.jobs_clone(),
-        SimulationEngine::with_registry_and_timeout(Arc::clone(&registry), simulation_timeout),
-        InsightsEngine::new(),
-        job_queue_config.clone(),
-    );
-    let _worker_handle = tokio::spawn(async move {
-        job_worker.run().await;
-    });
-    tracing::info!("Job worker started");
-    
-    // Spawn cleanup task
-    let _cleanup_handle = job_queue.spawn_cleanup_task();
-    tracing::info!(
-        interval_secs = job_queue_config.cleanup_interval_secs,
-        retention_secs = job_queue_config.retention_secs,
-        "Job cleanup task started"
-    );
-
     let app_state = Arc::new(AppState {
         engine: SimulationEngine::with_registry_and_timeout(
             Arc::clone(&registry),
@@ -908,7 +742,6 @@ async fn main() {
         cache: SimulationCache::new(),
         insights_engine: InsightsEngine::new(),
         simulation_timeout,
-        job_queue,
     });
 
     let cors = CorsLayer::new().allow_origin(Any);
@@ -917,9 +750,6 @@ async fn main() {
         .route("/analyze", post(analyze))
         .route("/analyze/optimize-limits", post(optimize_limits))
         .route("/analyze/compare", post(compare_handler))
-        .route("/jobs/submit", post(submit_job))
-        .route("/jobs/:id", get(get_job_status))
-        .route("/jobs/:id/cancel", post(cancel_job))
         .route_layer(middleware::from_fn(auth::auth_middleware));
 
     let app = Router::new()

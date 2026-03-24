@@ -3,6 +3,7 @@ mod benchmarks;
 mod comparison;
 mod errors;
 pub mod insights;
+mod jobs;
 mod parser;
 pub mod rpc_provider;
 mod simulation;
@@ -10,10 +11,11 @@ mod simulation;
 use crate::comparison::{CompareMode, RegressionFlag, RegressionReport, ResourceDelta};
 use crate::errors::AppError;
 use crate::insights::InsightsEngine;
+use crate::jobs::{JobId, JobQueue, JobQueueConfig, JobWorker, SubmitJobRequest, SubmitJobResponse};
 use crate::rpc_provider::{ProviderRegistry, RpcProvider};
 use crate::simulation::{SimulationCache, SimulationEngine, SimulationResult};
 use axum::{
-    extract::{Json, Multipart, State},
+    extract::{Json, Multipart, Path, State},
     http::{HeaderMap, HeaderName, HeaderValue},
     middleware,
     routing::{get, post},
@@ -61,6 +63,15 @@ struct AppConfig {
     /// Simulation timeout in seconds (default 30).
     #[serde(default = "default_simulation_timeout_secs")]
     simulation_timeout_secs: u64,
+    /// Database URL for job queue (PostgreSQL or SQLite)
+    #[serde(default = "default_database_url")]
+    database_url: String,
+    /// Job timeout in seconds (default 300).
+    #[serde(default = "default_job_timeout_secs")]
+    job_timeout_secs: u64,
+    /// Max concurrent jobs (default 10).
+    #[serde(default = "default_max_concurrent_jobs")]
+    max_concurrent_jobs: usize,
 }
 
 fn default_health_check_interval() -> u64 {
@@ -69,6 +80,18 @@ fn default_health_check_interval() -> u64 {
 
 fn default_simulation_timeout_secs() -> u64 {
     30
+}
+
+fn default_database_url() -> String {
+    "sqlite://soroscope.db".to_string()
+}
+
+fn default_job_timeout_secs() -> u64 {
+    300
+}
+
+fn default_max_concurrent_jobs() -> usize {
+    10
 }
 
 fn load_config() -> Result<AppConfig, ConfigError> {
@@ -85,6 +108,9 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("rpc_providers", "")?
         .set_default("health_check_interval_secs", 30)?
         .set_default("simulation_timeout_secs", 30)?
+        .set_default("database_url", "sqlite://soroscope.db")?
+        .set_default("job_timeout_secs", 300)?
+        .set_default("max_concurrent_jobs", 10)?
         .build()?;
 
     settings.try_deserialize()
@@ -129,6 +155,8 @@ struct AppState {
     insights_engine: InsightsEngine,
     /// Simulation timeout for RPC requests
     simulation_timeout: std::time::Duration,
+    /// Job queue for background task processing
+    job_queue: JobQueue,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

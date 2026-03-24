@@ -6,6 +6,8 @@ use axum::{
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::simulation::SimulationError;
+
 #[derive(Error, Debug)]
 #[allow(dead_code)]
 pub enum AppError {
@@ -57,5 +59,49 @@ impl IntoResponse for AppError {
         });
 
         (status, body).into_response()
+    }
+}
+
+/// Convert SimulationError to AppError with appropriate HTTP status codes.
+/// 
+/// Maps client errors (4xx) to BadRequest and server errors (5xx) to Internal.
+impl From<SimulationError> for AppError {
+    fn from(err: SimulationError) -> Self {
+        match err {
+            // Client errors (HTTP 400)
+            SimulationError::NodeError(msg) => {
+                // NodeError covers invalid contract IDs, bad parameters
+                AppError::BadRequest(format!("RPC node error: {}", msg))
+            }
+            SimulationError::InvalidContract(msg) => {
+                AppError::BadRequest(format!("Invalid contract: {}", msg))
+            }
+            SimulationError::ParseError(e) => {
+                AppError::BadRequest(format!("Argument parse error: {}", e))
+            }
+            SimulationError::XdrError(msg) => {
+                AppError::BadRequest(format!("XDR encoding error: {}", msg))
+            }
+            SimulationError::Base64Error(e) => {
+                AppError::BadRequest(format!("Base64 decode error: {}", e))
+            }
+            
+            // Server errors (HTTP 500)
+            SimulationError::NodeTimeout => {
+                AppError::Internal("RPC request timed out".to_string())
+            }
+            SimulationError::RpcRequestFailed(msg) => {
+                AppError::Internal(format!("RPC request failed: {}", msg))
+            }
+            SimulationError::NetworkError(e) => {
+                AppError::Internal(format!("Network error: {}", e))
+            }
+            SimulationError::Io(e) => {
+                AppError::Internal(format!("IO error: {}", e))
+            }
+            SimulationError::SerializationError(e) => {
+                AppError::Internal(format!("Serialization error: {}", e))
+            }
+        }
     }
 }

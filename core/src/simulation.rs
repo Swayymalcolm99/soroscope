@@ -202,6 +202,29 @@ impl SimulationEngine {
         }
     }
 
+    /// Create an engine with a custom request timeout.
+    pub fn with_registry_and_timeout(
+        registry: Arc<ProviderRegistry>,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            rpc_url: String::new(),
+            client: Client::new(),
+            request_timeout: timeout,
+            registry: Some(registry),
+        }
+    }
+
+    /// Update the request timeout for subsequent simulation calls.
+    pub fn set_timeout(&mut self, timeout: std::time::Duration) {
+        self.request_timeout = timeout;
+    }
+
+    /// Get the current request timeout.
+    pub fn timeout(&self) -> std::time::Duration {
+        self.request_timeout
+    }
+
     /// Simulate transaction from a deployed contract ID
     ///
     /// # Arguments

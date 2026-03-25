@@ -11,7 +11,9 @@ mod simulation;
 use crate::comparison::{CompareMode, RegressionFlag, RegressionReport, ResourceDelta};
 use crate::errors::AppError;
 use crate::insights::InsightsEngine;
-use crate::jobs::{JobId, JobQueue, JobQueueConfig, JobWorker, SubmitJobRequest, SubmitJobResponse};
+use crate::jobs::{
+    JobId, JobQueue, JobQueueConfig, JobWorker, SubmitJobRequest, SubmitJobResponse,
+};
 use crate::rpc_provider::{ProviderRegistry, RpcProvider};
 use crate::simulation::{SimulationCache, SimulationEngine, SimulationResult};
 use axum::{
@@ -246,6 +248,20 @@ pub struct OptimizeLimitsResponse {
     pub recommended: crate::simulation::SorobanResources,
 }
 
+/// Request body for the WASM-bytes analysis endpoint.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AnalyzeWasmRequest {
+    /// Base64-encoded WASM binary.
+    #[schema(example = "<base64-encoded .wasm bytes>")]
+    pub wasm_bytes: String,
+    /// Name of the exported function to invoke.
+    #[schema(example = "hello")]
+    pub function_name: String,
+    /// Optional function arguments (void | true | false | integers | symbols).
+    #[schema(example = "[]")]
+    pub args: Option<Vec<String>>,
+}
+
 /// Convert a `SimulationResult` (library type) into the API `ResourceReport`.
 fn to_report(result: &SimulationResult, insights_engine: &InsightsEngine) -> ResourceReport {
     let insights_report = insights_engine.analyze(&result.resources);
@@ -322,7 +338,7 @@ async fn analyze(
             (cached, "HIT")
         } else {
             tracing::debug!("Cache MISS for key: {}", cache_key);
-            
+
             // Wrap the simulation call with a timeout to prevent hanging
             let sim_result = tokio::time::timeout(
                 state.simulation_timeout,
@@ -377,6 +393,58 @@ async fn analyze(
     );
 
     Ok((headers, Json(to_report(&result, &state.insights_engine))))
+}
+
+#[utoipa::path(
+    post,
+    path = "/analyze/wasm",
+    request_body = AnalyzeWasmRequest,
+    responses(
+        (status = 200, description = "Resource analysis successful", body = ResourceReport),
+        (status = 400, description = "Invalid base64 or WASM data"),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Analysis failed")
+    ),
+    security(
+        ("jwt" = [])
+    ),
+    tag = "Analysis"
+)]
+async fn analyze_wasm(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<AnalyzeWasmRequest>,
+) -> Result<Json<ResourceReport>, AppError> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+    tracing::info!(
+        function_name = %payload.function_name,
+        "Received WASM analyze request"
+    );
+
+    let wasm_bytes = BASE64
+        .decode(&payload.wasm_bytes)
+        .map_err(|e| AppError::BadRequest(format!("Invalid base64 WASM data: {}", e)))?;
+
+    let function_name = payload.function_name.clone();
+    let args = payload.args.clone().unwrap_or_default();
+
+    let resources = tokio::task::spawn_blocking(move || {
+        simulation::profile_contract(wasm_bytes, function_name, args)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("Contract profiling task panicked: {}", e)))?
+    .map_err(|e| AppError::Internal(format!("Contract profiling failed: {}", e)))?;
+
+    let sim_result = simulation::SimulationResult {
+        resources,
+        transaction_hash: None,
+        latest_ledger: 0,
+        cost_stroops: 0,
+        state_dependency: None,
+        transaction_data: String::new(),
+    };
+
+    Ok(Json(to_report(&sim_result, &state.insights_engine)))
 }
 
 #[utoipa::path(
@@ -577,11 +645,11 @@ fn write_temp_wasm(bytes: &[u8]) -> Result<std::path::PathBuf, AppError> {
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        analyze, optimize_limits, compare_handler,
+        analyze, analyze_wasm, optimize_limits, compare_handler,
         auth::challenge_handler, auth::verify_handler
     ),
     components(schemas(
-        AnalyzeRequest, ResourceReport,
+        AnalyzeRequest, AnalyzeWasmRequest, ResourceReport,
         OptimizeLimitsRequest, OptimizeLimitsResponse,
         CompareApiResponse, RegressionReport, ResourceDelta, RegressionFlag,
         auth::ChallengeRequest, auth::ChallengeResponse,
@@ -732,7 +800,10 @@ async fn main() {
     );
 
     let simulation_timeout = std::time::Duration::from_secs(config.simulation_timeout_secs);
-    tracing::info!(timeout_secs = config.simulation_timeout_secs, "Simulation timeout configured");
+    tracing::info!(
+        timeout_secs = config.simulation_timeout_secs,
+        "Simulation timeout configured"
+    );
 
     let app_state = Arc::new(AppState {
         engine: SimulationEngine::with_registry_and_timeout(
@@ -748,6 +819,7 @@ async fn main() {
 
     let protected = Router::new()
         .route("/analyze", post(analyze))
+        .route("/analyze/wasm", post(analyze_wasm))
         .route("/analyze/optimize-limits", post(optimize_limits))
         .route("/analyze/compare", post(compare_handler))
         .route_layer(middleware::from_fn(auth::auth_middleware));
@@ -801,7 +873,7 @@ mod tests {
     fn test_error_mapping_node_error() {
         let sim_err = SimulationError::NodeError("Invalid contract ID".to_string());
         let app_err: AppError = sim_err.into();
-        
+
         match app_err {
             AppError::BadRequest(msg) => {
                 assert!(msg.contains("Invalid contract ID"));
@@ -814,7 +886,7 @@ mod tests {
     fn test_error_mapping_invalid_contract() {
         let sim_err = SimulationError::InvalidContract("Contract not found".to_string());
         let app_err: AppError = sim_err.into();
-        
+
         match app_err {
             AppError::BadRequest(msg) => {
                 assert!(msg.contains("Contract not found"));
@@ -827,7 +899,7 @@ mod tests {
     fn test_error_mapping_timeout() {
         let sim_err = SimulationError::NodeTimeout;
         let app_err: AppError = sim_err.into();
-        
+
         match app_err {
             AppError::Internal(msg) => {
                 assert!(msg.contains("timed out"));
@@ -840,7 +912,7 @@ mod tests {
     fn test_error_mapping_rpc_request_failed() {
         let sim_err = SimulationError::RpcRequestFailed("Connection refused".to_string());
         let app_err: AppError = sim_err.into();
-        
+
         match app_err {
             AppError::Internal(msg) => {
                 assert!(msg.contains("Connection refused"));
@@ -854,7 +926,7 @@ mod tests {
         // Create a mock reqwest error (we can't easily create one, so test via RpcRequestFailed)
         let sim_err = SimulationError::RpcRequestFailed("Network unreachable".to_string());
         let app_err: AppError = sim_err.into();
-        
+
         match app_err {
             AppError::Internal(msg) => {
                 assert!(msg.contains("Network unreachable"));
@@ -900,11 +972,11 @@ mod tests {
     #[test]
     fn test_simulation_engine_timeout_configurable() {
         use std::time::Duration;
-        
+
         // Create a mock registry (we can't easily create one without mocking)
         // Instead, test that the SimulationEngine has timeout methods
         let engine = SimulationEngine::new("https://test.com".to_string());
-        
+
         // Default should be 30 seconds
         assert_eq!(engine.timeout(), Duration::from_secs(30));
     }

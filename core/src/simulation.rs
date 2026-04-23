@@ -6,11 +6,15 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use soroban_sdk::xdr::{
-    Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerEntry, LedgerKey, Limits,
-    Memo, MuxedAccount, Operation, OperationBody, Preconditions, ReadXdr, ScAddress, ScSymbol,
-    ScVal, SequenceNumber, SorobanAuthorizationEntry, SorobanTransactionData, Transaction,
-    TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    AccountId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, HostFunction,
+    InvokeContractArgs, InvokeHostFunctionOp, LedgerEntry, LedgerKey, Limits, Memo, MuxedAccount,
+    Operation, OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress, ScMapEntry, ScSymbol,
+    ScVal, SequenceNumber, SorobanAddressCredentials, SorobanAuthorizationEntry,
+    SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials,
+    SorobanTransactionData, Transaction, TransactionExt, TransactionV1Envelope, Uint256, VecM,
+    WriteXdr,
 };
+use ed25519_dalek::Signer as Ed25519Signer;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -195,6 +199,22 @@ struct SimulationRpcResult {
 struct ResourceCost {
     cpu_insns: String,
     mem_bytes: String,
+}
+// ── Multi-account authorization ───────────────────────────────────────────────
+
+/// Represents one signer in a multi-account authorization scenario.
+///
+/// Use `SecretKey` when you hold the raw secret and want the engine to sign
+/// automatically. Use `PreSignedXdr` when signing happened outside the engine
+/// (hardware wallet, multisig coordinator, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuthSigner {
+    /// Raw Stellar secret key (S...). The engine builds and signs the
+    /// `SorobanAuthorizationEntry` automatically.
+    SecretKey { secret: String },
+    /// A fully-formed, already-signed `SorobanAuthorizationEntry` in base64 XDR.
+    PreSignedXdr { xdr: String },
 }
 
 #[derive(Debug, Serialize)]
@@ -1202,12 +1222,207 @@ impl SimulationEngine {
         let final_deps = state_dependency;
 
         result.state_dependency = Some(final_deps);
+Ok(result)
+    }
+
+    // ── Multi-account authorization simulation
+// ── Multi-account authorization simulation ────────────────────────────────
+
+    /// Simulate a contract call requiring authorization from one or more accounts.
+    ///
+    /// # Arguments
+    /// * `contract_id`        - Deployed contract (C...)
+    /// * `function_name`      - Entry-point to invoke
+    /// * `args`               - Function arguments
+    /// * `signers`            - One `AuthSigner` per required signer
+    /// * `network_passphrase` - Stellar network passphrase (e.g. "Test SDF Network ; September 2015")
+    /// * `expiration_ledger`  - Ledger at which auth entries expire
+    pub async fn simulate_with_auth(
+        &self,
+        contract_id: &str,
+        function_name: &str,
+        args: Vec<String>,
+        signers: Vec<AuthSigner>,
+        network_passphrase: &str,
+        expiration_ledger: u32,
+    ) -> Result<SimulationResult, SimulationError> {
+        let contract_hash = self.parse_contract_id(contract_id)?;
+        let contract_address = ScAddress::Contract(Hash(contract_hash));
+        let func_symbol: ScSymbol = function_name
+            .try_into()
+            .map_err(|_| SimulationError::NodeError("Invalid function name".to_string()))?;
+        let sc_args: VecM<ScVal> = args
+            .iter()
+            .map(|a| self.parse_sc_val_arg(a))
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| SimulationError::NodeError("Too many arguments".to_string()))?;
+
+        // Build the root invocation shared across all auth entries
+        let root_invocation = Self::build_root_invocation(
+            contract_address.clone(),
+            func_symbol.clone(),
+            sc_args.clone(),
+        );
+
+        // Collect and sign auth entries for every signer
+        let auth_entries = self.collect_auth_entries(
+            &signers,
+            &root_invocation,
+            network_passphrase,
+            expiration_ledger,
+        )?;
         result.ttl_analysis = None;
 
-        Ok(result)
+        tracing::info!(
+            signers = signers.len(),
+            auth_entries = auth_entries.len(),
+            "Simulating with multi-account authorization"
+        );
+
+        let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address,
+            function_name: func_symbol,
+            args: sc_args,
+        });
+
+        let transaction_xdr =
+            self.build_invoke_host_function_transaction(host_function, auth_entries)?;
+        self.simulate_transaction(&transaction_xdr).await
+    }
+
+    /// Build a `SorobanAuthorizedInvocation` for the given contract call.
+    fn build_root_invocation(
+        contract_address: ScAddress,
+        function_name: ScSymbol,
+        args: VecM<ScVal>,
+    ) -> SorobanAuthorizedInvocation {
+        SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address,
+                function_name,
+                args,
+            }),
+            sub_invocations: VecM::default(),
+        }
+    }
+
+    /// Convert a slice of `AuthSigner` values into ready-to-inject
+    /// `SorobanAuthorizationEntry` objects.
+    pub fn collect_auth_entries(
+        &self,
+        signers: &[AuthSigner],
+        root_invocation: &SorobanAuthorizedInvocation,
+        network_passphrase: &str,
+        expiration_ledger: u32,
+    ) -> Result<Vec<SorobanAuthorizationEntry>, SimulationError> {
+        signers
+            .iter()
+            .map(|signer| match signer {
+                AuthSigner::PreSignedXdr { xdr } => {
+                    let bytes = BASE64
+                        .decode(xdr)
+                        .map_err(SimulationError::Base64Error)?;
+                    SorobanAuthorizationEntry::from_xdr(&bytes, Limits::none()).map_err(|e| {
+                        SimulationError::XdrError(format!("Invalid auth entry XDR: {e}"))
+                    })
+                }
+                AuthSigner::SecretKey { secret } => self.sign_auth_entry(
+                    secret,
+                    root_invocation,
+                    network_passphrase,
+                    expiration_ledger,
+                ),
+            })
+            .collect()
+    }
+
+    /// Parse a Stellar secret key, build a `SorobanAuthorizationEntry`,
+    /// sign the auth preimage with ed25519, and return the completed entry.
+    pub fn sign_auth_entry(
+        &self,
+        secret: &str,
+        invocation: &SorobanAuthorizedInvocation,
+        network_passphrase: &str,
+        expiration_ledger: u32,
+    ) -> Result<SorobanAuthorizationEntry, SimulationError> {
+        use ed25519_dalek::SigningKey;
+
+        // 1. Parse the Stellar secret key (S...)
+        let strkey = Strkey::from_string(secret)
+            .map_err(|e| SimulationError::NodeError(format!("Invalid secret key: {e}")))?;
+        let seed = match strkey {
+            Strkey::PrivateKeyEd25519(sk) => sk.0,
+            _ => {
+                return Err(SimulationError::NodeError(
+                    "Expected S... secret key".to_string(),
+                ))
+            }
+        };
+        let signing_key = SigningKey::from_bytes(&seed);
+        let public_key = signing_key.verifying_key().to_bytes();
+
+        // 2. Derive a deterministic nonce: sha256(pubkey || invocation_xdr)[0..8]
+        let invocation_xdr = invocation
+            .to_xdr(Limits::none())
+            .map_err(|e| SimulationError::XdrError(format!("Encode invocation: {e}")))?;
+        let nonce_input = [&public_key[..], &invocation_xdr[..]].concat();
+        let nonce_hash = Sha256::digest(&nonce_input);
+        let nonce = i64::from_be_bytes(nonce_hash[..8].try_into().unwrap());
+
+        // 3. Compute the network id
+        let network_id: [u8; 32] = Sha256::digest(network_passphrase.as_bytes()).into();
+
+        // 4. Build and hash the auth preimage
+        let preimage =
+            HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+                network_id: Hash(network_id),
+                invocation: invocation.clone(),
+                nonce,
+                signature_expiration_ledger: expiration_ledger,
+            });
+        let preimage_bytes = preimage
+            .to_xdr(Limits::none())
+            .map_err(|e| SimulationError::XdrError(format!("Encode preimage: {e}")))?;
+        let auth_hash: [u8; 32] = Sha256::digest(&preimage_bytes).into();
+
+        // 5. Sign the hash with ed25519
+        let signature: [u8; 64] = signing_key.sign(&auth_hash).to_bytes();
+
+        // 6. Build the Soroban signature map: { pubkey_bytes => sig_bytes }
+        let sig_map = ScVal::Map(Some(
+            vec![ScMapEntry {
+                key: ScVal::Bytes(
+                    public_key
+                        .to_vec()
+                        .try_into()
+                        .map_err(|_| SimulationError::XdrError("pubkey bytes".into()))?,
+                ),
+                val: ScVal::Bytes(
+                    signature
+                        .to_vec()
+                        .try_into()
+                        .map_err(|_| SimulationError::XdrError("sig bytes".into()))?,
+                ),
+            }]
+            .try_into()
+            .map_err(|_| SimulationError::XdrError("sig map".into()))?,
+        ));
+
+        // 7. Assemble the final auth entry
+        Ok(SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
+                    Uint256(public_key),
+                ))),
+                nonce,
+                signature_expiration_ledger: expiration_ledger,
+                signature: sig_map,
+            }),
+            root_invocation: invocation.clone(),
+        })
     }
 }
-
 // ── Local WASM profiling ──────────────────────────────────────────────────────
 
 /// Profile a contract from raw WASM bytes using a local Soroban test environment.
@@ -1710,6 +1925,116 @@ mod tests {
             assert_eq!(cache.get(&k2).await.unwrap().latest_ledger, 2);
         }
     }
+    // ── Multi-auth tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_root_invocation_structure() {
+        use soroban_sdk::xdr::SorobanAuthorizedFunction;
+
+        let contract_hash = [1u8; 32];
+        let addr = ScAddress::Contract(Hash(contract_hash));
+        let sym: ScSymbol = "transfer".try_into().unwrap();
+        let args: VecM<ScVal> = vec![ScVal::Bool(true)].try_into().unwrap();
+
+        let inv = SimulationEngine::build_root_invocation(addr, sym.clone(), args);
+
+        match &inv.function {
+            SorobanAuthorizedFunction::ContractFn(f) => {
+                assert_eq!(f.function_name, sym);
+            }
+            _ => panic!("unexpected function type"),
+        }
+        assert_eq!(inv.sub_invocations.len(), 0);
+    }
+
+    #[test]
+    fn test_collect_auth_entries_invalid_base64_is_rejected() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let signers = vec![AuthSigner::PreSignedXdr {
+            xdr: "!!!not-base64!!!".to_string(),
+        }];
+        let dummy_inv = SimulationEngine::build_root_invocation(
+            ScAddress::Contract(Hash([0u8; 32])),
+            "fn".try_into().unwrap(),
+            VecM::default(),
+        );
+        let result = engine.collect_auth_entries(&signers, &dummy_inv, "Test", 1000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_collect_auth_entries_invalid_xdr_is_rejected() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        // valid base64 but not a SorobanAuthorizationEntry
+        let bad_xdr = BASE64.encode(b"this is not valid xdr");
+        let signers = vec![AuthSigner::PreSignedXdr { xdr: bad_xdr }];
+        let dummy_inv = SimulationEngine::build_root_invocation(
+            ScAddress::Contract(Hash([0u8; 32])),
+            "fn".try_into().unwrap(),
+            VecM::default(),
+        );
+        let result = engine.collect_auth_entries(&signers, &dummy_inv, "Test", 1000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sign_auth_entry_invalid_secret_rejected() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let dummy_inv = SimulationEngine::build_root_invocation(
+            ScAddress::Contract(Hash([0u8; 32])),
+            "fn".try_into().unwrap(),
+            VecM::default(),
+        );
+        let result = engine.sign_auth_entry("NOT_A_SECRET", &dummy_inv, "Test Network", 1000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sign_auth_entry_wrong_key_type_rejected() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let dummy_inv = SimulationEngine::build_root_invocation(
+            ScAddress::Contract(Hash([0u8; 32])),
+            "fn".try_into().unwrap(),
+            VecM::default(),
+        );
+        // G... address is a public key, not a secret — must be rejected
+        let result = engine.sign_auth_entry(
+            "GABC1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFG",
+            &dummy_inv,
+            "Test Network",
+            1000,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_empty_signers_produces_empty_auth_entries() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let dummy_inv = SimulationEngine::build_root_invocation(
+            ScAddress::Contract(Hash([0u8; 32])),
+            "fn".try_into().unwrap(),
+            VecM::default(),
+        );
+        let result = engine
+            .collect_auth_entries(&[], &dummy_inv, "Test Network", 1000)
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_auth_signer_serialization() {
+        let signer = AuthSigner::SecretKey {
+            secret: "STEST".to_string(),
+        };
+        let json = serde_json::to_string(&signer).unwrap();
+        assert!(json.contains("secret_key"));
+        assert!(json.contains("STEST"));
+
+        let signer2 = AuthSigner::PreSignedXdr {
+            xdr: "AAAA".to_string(),
+        };
+        let json2 = serde_json::to_string(&signer2).unwrap();
+        assert!(json2.contains("pre_signed_xdr"));
 
     #[test]
     fn test_build_extend_ttl_suggestions_flags_low_ttl_entries() {

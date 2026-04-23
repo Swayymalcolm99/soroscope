@@ -195,8 +195,34 @@ pub struct ResourceReport {
     pub cost_stroops: u64,
     /// Report showing which data was injected vs live
     pub state_dependency: Option<Vec<StateDependencyReport>>,
+    /// TTL status for touched ledger entries and extension suggestions.
+    pub ttl_analysis: Option<TtlAnalysisApiReport>,
     /// Efficiency score (0–100) and optimisation insights.
     pub nutrition: NutritionReport,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct TtlAnalysisApiReport {
+    pub current_ledger: u64,
+    pub touched_entries: Vec<TtlEntryApiReport>,
+    pub extend_ttl_suggestions: Vec<ExtendTtlSuggestionApi>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct TtlEntryApiReport {
+    pub key: String,
+    pub live_until_ledger: u32,
+    pub remaining_ledgers: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ExtendTtlSuggestionApi {
+    pub key: String,
+    pub current_live_until_ledger: u32,
+    pub remaining_ledgers: i64,
+    pub extend_to_ledger: u32,
+    pub ledgers_to_extend_by: u32,
+    pub suggested_operation: String,
 }
 
 /// "Nutrition label" for the contract invocation.
@@ -280,6 +306,30 @@ fn to_report(result: &SimulationResult, insights_engine: &InsightsEngine) -> Res
                     source: format!("{:?}", d.source),
                 })
                 .collect()
+        }),
+        ttl_analysis: result.ttl_analysis.as_ref().map(|ttl| TtlAnalysisApiReport {
+            current_ledger: ttl.current_ledger,
+            touched_entries: ttl
+                .touched_entries
+                .iter()
+                .map(|e| TtlEntryApiReport {
+                    key: e.key.clone(),
+                    live_until_ledger: e.live_until_ledger,
+                    remaining_ledgers: e.remaining_ledgers,
+                })
+                .collect(),
+            extend_ttl_suggestions: ttl
+                .extend_ttl_suggestions
+                .iter()
+                .map(|s| ExtendTtlSuggestionApi {
+                    key: s.key.clone(),
+                    current_live_until_ledger: s.current_live_until_ledger,
+                    remaining_ledgers: s.remaining_ledgers,
+                    extend_to_ledger: s.extend_to_ledger,
+                    ledgers_to_extend_by: s.ledgers_to_extend_by,
+                    suggested_operation: s.suggested_operation.clone(),
+                })
+                .collect(),
         }),
         nutrition: NutritionReport {
             efficiency_score: insights_report.efficiency_score,
@@ -441,6 +491,7 @@ async fn analyze_wasm(
         latest_ledger: 0,
         cost_stroops: 0,
         state_dependency: None,
+        ttl_analysis: None,
         transaction_data: String::new(),
     };
 
@@ -949,6 +1000,7 @@ mod tests {
             latest_ledger: 12345,
             cost_stroops: 5000,
             state_dependency: None,
+            ttl_analysis: None,
             transaction_data: "AAA".to_string(),
         };
 

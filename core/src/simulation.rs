@@ -95,6 +95,8 @@ pub struct SimulationResult {
     pub cost_stroops: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_dependency: Option<Vec<StateDependency>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_analysis: Option<TtlAnalysisReport>,
     /// The SorobanTransactionData XDR returned by the RPC (base64)
     pub transaction_data: String,
 }
@@ -109,6 +111,30 @@ pub struct StateDependency {
 pub enum DataSource {
     Live,
     Injected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TtlEntryReport {
+    pub key: String,
+    pub live_until_ledger: u32,
+    pub remaining_ledgers: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExtendTtlSuggestion {
+    pub key: String,
+    pub current_live_until_ledger: u32,
+    pub remaining_ledgers: i64,
+    pub extend_to_ledger: u32,
+    pub ledgers_to_extend_by: u32,
+    pub suggested_operation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TtlAnalysisReport {
+    pub current_ledger: u64,
+    pub touched_entries: Vec<TtlEntryReport>,
+    pub extend_ttl_suggestions: Vec<ExtendTtlSuggestion>,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,7 +176,7 @@ struct RpcError {
     data: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SimulationRpcResult {
     #[serde(default)]
@@ -171,6 +197,47 @@ struct ResourceCost {
     mem_bytes: String,
 }
 
+#[derive(Debug, Serialize)]
+struct GetLedgerEntriesRequest {
+    jsonrpc: String,
+    id: u64,
+    method: String,
+    params: GetLedgerEntriesParams,
+}
+
+#[derive(Debug, Serialize)]
+struct GetLedgerEntriesParams {
+    keys: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetLedgerEntriesResponse {
+    #[serde(flatten)]
+    result: LedgerEntriesResponseResult,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum LedgerEntriesResponseResult {
+    Success { result: GetLedgerEntriesResult },
+    Error { error: RpcError },
+}
+
+#[derive(Debug, Deserialize)]
+struct GetLedgerEntriesResult {
+    #[serde(default)]
+    entries: Vec<LedgerEntryWithMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LedgerEntryWithMeta {
+    key: String,
+    #[allow(dead_code)]
+    xdr: Option<String>,
+    live_until_ledger_seq: Option<u32>,
+}
+
 pub struct SimulationEngine {
     /// Kept for single-provider backward compatibility; empty when using registry.
     rpc_url: String,
@@ -181,6 +248,9 @@ pub struct SimulationEngine {
 }
 
 impl SimulationEngine {
+    const TTL_WARNING_THRESHOLD_LEDGERS: i64 = 120_000;
+    const TTL_TARGET_LEDGERS_AHEAD: i64 = 360_000;
+
     /// Create an engine backed by a single RPC URL (backward-compatible).
     #[allow(dead_code)]
     pub fn new(rpc_url: String) -> Self {
@@ -636,9 +706,180 @@ impl SimulationEngine {
             }
             ResponseResult::Success { result } => {
                 tracing::info!("Simulation successful at ledger {}", result.latest_ledger);
-                self.parse_simulation_result(result)
+                let mut parsed = self.parse_simulation_result(result.clone())?;
+                let touched_keys = self.extract_touched_ledger_keys(&result.transaction_data);
+
+                if !touched_keys.is_empty() {
+                    parsed.state_dependency = Some(
+                        touched_keys
+                            .iter()
+                            .map(|k| StateDependency {
+                                key: k.clone(),
+                                source: DataSource::Live,
+                            })
+                            .collect(),
+                    );
+
+                    match self
+                        .analyze_ttl_for_touched_entries(
+                            url,
+                            auth_header,
+                            auth_value,
+                            &touched_keys,
+                            result.latest_ledger,
+                        )
+                        .await
+                    {
+                        Ok(ttl_report) => {
+                            if !ttl_report.touched_entries.is_empty() {
+                                parsed.ttl_analysis = Some(ttl_report);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("TTL analysis skipped due to RPC error: {}", e);
+                        }
+                    }
+                }
+
+                Ok(parsed)
             }
         }
+    }
+
+    fn extract_touched_ledger_keys(&self, transaction_data: &str) -> Vec<String> {
+        if transaction_data.is_empty() {
+            return Vec::new();
+        }
+
+        let xdr_bytes = match BASE64.decode(transaction_data) {
+            Ok(bytes) => bytes,
+            Err(_) => return Vec::new(),
+        };
+
+        let soroban_data = match SorobanTransactionData::from_xdr(&xdr_bytes, Limits::none()) {
+            Ok(data) => data,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut out = Vec::new();
+        let mut push_key = |key: &LedgerKey| {
+            if let Ok(bytes) = key.to_xdr(Limits::none()) {
+                out.push(BASE64.encode(bytes));
+            }
+        };
+
+        for key in soroban_data.resources.footprint.read_only.iter() {
+            push_key(key);
+        }
+        for key in soroban_data.resources.footprint.read_write.iter() {
+            push_key(key);
+        }
+
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    async fn analyze_ttl_for_touched_entries(
+        &self,
+        url: &str,
+        auth_header: Option<&str>,
+        auth_value: Option<&str>,
+        touched_keys: &[String],
+        latest_ledger: u64,
+    ) -> Result<TtlAnalysisReport, SimulationError> {
+        let req = GetLedgerEntriesRequest {
+            jsonrpc: "2.0".to_string(),
+            id: 1,
+            method: "getLedgerEntries".to_string(),
+            params: GetLedgerEntriesParams {
+                keys: touched_keys.to_vec(),
+            },
+        };
+
+        let mut req_builder = self.client.post(url).json(&req);
+        if let (Some(header), Some(value)) = (auth_header, auth_value) {
+            req_builder = req_builder.header(header, value);
+        }
+
+        let response = tokio::time::timeout(self.request_timeout, req_builder.send())
+            .await
+            .map_err(|_| SimulationError::NodeTimeout)?
+            .map_err(|e| SimulationError::RpcRequestFailed(format!("Network error: {}", e)))?;
+
+        if !response.status().is_success() {
+            return Err(SimulationError::RpcRequestFailed(format!(
+                "HTTP error: {}",
+                response.status()
+            )));
+        }
+
+        let rpc_response: GetLedgerEntriesResponse = response.json().await.map_err(|e| {
+            SimulationError::RpcRequestFailed(format!("Failed to parse response: {}", e))
+        })?;
+
+        let entries = match rpc_response.result {
+            LedgerEntriesResponseResult::Success { result } => result.entries,
+            LedgerEntriesResponseResult::Error { error } => {
+                return Err(SimulationError::RpcRequestFailed(format!(
+                    "RPC error {}: {}",
+                    error.code, error.message
+                )))
+            }
+        };
+
+        let touched_entries: Vec<TtlEntryReport> = entries
+            .into_iter()
+            .filter_map(|entry| {
+                let live_until = entry.live_until_ledger_seq?;
+                let remaining = live_until as i64 - latest_ledger as i64;
+                Some(TtlEntryReport {
+                    key: entry.key,
+                    live_until_ledger: live_until,
+                    remaining_ledgers: remaining,
+                })
+            })
+            .collect();
+
+        let extend_ttl_suggestions =
+            Self::build_extend_ttl_suggestions(&touched_entries, latest_ledger);
+
+        Ok(TtlAnalysisReport {
+            current_ledger: latest_ledger,
+            touched_entries,
+            extend_ttl_suggestions,
+        })
+    }
+
+    fn build_extend_ttl_suggestions(
+        touched_entries: &[TtlEntryReport],
+        latest_ledger: u64,
+    ) -> Vec<ExtendTtlSuggestion> {
+        touched_entries
+            .iter()
+            .filter_map(|entry| {
+                if entry.remaining_ledgers > Self::TTL_WARNING_THRESHOLD_LEDGERS {
+                    return None;
+                }
+
+                let target = latest_ledger as i64 + Self::TTL_TARGET_LEDGERS_AHEAD;
+                let extend_to_ledger = target.max(entry.live_until_ledger as i64) as u32;
+                let ledgers_to_extend_by = extend_to_ledger.saturating_sub(entry.live_until_ledger);
+
+                Some(ExtendTtlSuggestion {
+                    key: entry.key.clone(),
+                    current_live_until_ledger: entry.live_until_ledger,
+                    remaining_ledgers: entry.remaining_ledgers,
+                    extend_to_ledger,
+                    ledgers_to_extend_by,
+                    suggested_operation: format!(
+                        "env.storage().persistent().extend_ttl(<key>, {}, {})",
+                        Self::TTL_WARNING_THRESHOLD_LEDGERS,
+                        Self::TTL_TARGET_LEDGERS_AHEAD
+                    ),
+                })
+            })
+            .collect()
     }
 
     fn parse_simulation_result(
@@ -675,6 +916,7 @@ impl SimulationEngine {
             latest_ledger: rpc_result.latest_ledger,
             cost_stroops,
             state_dependency: None,
+            ttl_analysis: None,
             transaction_data: rpc_result.transaction_data,
         })
     }
@@ -960,6 +1202,7 @@ impl SimulationEngine {
         let final_deps = state_dependency;
 
         result.state_dependency = Some(final_deps);
+        result.ttl_analysis = None;
 
         Ok(result)
     }
@@ -1375,6 +1618,7 @@ mod tests {
                 latest_ledger: 42,
                 cost_stroops: 10,
                 state_dependency: None,
+                ttl_analysis: None,
                 transaction_data: "AAA=".to_string(),
             }
         }
@@ -1465,5 +1709,26 @@ mod tests {
             assert_eq!(cache.get(&k1).await.unwrap().latest_ledger, 1);
             assert_eq!(cache.get(&k2).await.unwrap().latest_ledger, 2);
         }
+    }
+
+    #[test]
+    fn test_build_extend_ttl_suggestions_flags_low_ttl_entries() {
+        let entries = vec![
+            TtlEntryReport {
+                key: "key-a".to_string(),
+                live_until_ledger: 1_000,
+                remaining_ledgers: 500,
+            },
+            TtlEntryReport {
+                key: "key-b".to_string(),
+                live_until_ledger: 500_000,
+                remaining_ledgers: 200_000,
+            },
+        ];
+
+        let suggestions = SimulationEngine::build_extend_ttl_suggestions(&entries, 500);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].key, "key-a");
+        assert!(suggestions[0].ledgers_to_extend_by > 0);
     }
 }

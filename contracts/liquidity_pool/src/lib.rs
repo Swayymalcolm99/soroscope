@@ -22,6 +22,10 @@ pub enum Error {
     InvalidFee = 8,
     Paused = 9,
     InsufficientAllowance = 10,
+    OracleNotConfigured = 11,
+    InvalidOraclePrice = 12,
+    TimelockNotElapsed = 13,
+    NoPendingFeeUpdate = 14,
 }
 
 // Event structures for state-changing operations
@@ -87,6 +91,24 @@ pub struct FeeChangedEvent {
     pub new_fee_bps: i128,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeUpdateScheduledEvent {
+    pub scheduled_by: Address,
+    pub old_fee_bps: i128,
+    pub new_fee_bps: i128,
+    pub executable_after_ledger: u32,
+    pub volatility_bps: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingFeeUpdate {
+    pub new_fee_bps: i128,
+    pub executable_after_ledger: u32,
+    pub based_on_volatility_bps: i128,
+}
+
 // Helper function: integer square root using Newton's method
 fn sqrt(x: i128) -> i128 {
     if x == 0 {
@@ -132,8 +154,32 @@ pub enum DataKey {
     Allowance(AllowanceDataKey),
     Admin,
     FeeBasisPoints,
+    BaseFeeBasisPoints,
+    OracleAddress,
+    LastOraclePrice,
+    LastVolatilityBps,
+    FeeUpdateTimelockLedgers,
+    PendingFeeUpdate,
     Paused,
 }
+
+pub const MAX_FEE_BPS: i128 = 100;
+pub const DEFAULT_BASE_FEE_BPS: i128 = 30;
+pub const DEFAULT_FEE_TIMELOCK_LEDGERS: u32 = 120;
+
+pub const LOW_VOLATILITY_THRESHOLD_BPS: i128 = 100;
+pub const MEDIUM_VOLATILITY_THRESHOLD_BPS: i128 = 250;
+pub const HIGH_VOLATILITY_THRESHOLD_BPS: i128 = 500;
+
+pub const LOW_VOLATILITY_FEE_BPS: i128 = 40;
+pub const MEDIUM_VOLATILITY_FEE_BPS: i128 = 70;
+pub const HIGH_VOLATILITY_FEE_BPS: i128 = 100;
+
+pub trait PriceOracle {
+    fn latest_price(e: Env) -> i128;
+}
+
+soroban_sdk::contractclient!(name = "PriceOracleClient", trait = PriceOracle);
 
 fn check_paused(e: &Env) -> Result<(), Error> {
     let paused: bool = e
@@ -182,7 +228,13 @@ impl LiquidityPool {
         // Default fee: 30 bps (≈ 0.3%)
         e.storage()
             .instance()
-            .set(&DataKey::FeeBasisPoints, &30i128);
+            .set(&DataKey::FeeBasisPoints, &DEFAULT_BASE_FEE_BPS);
+        e.storage()
+            .instance()
+            .set(&DataKey::BaseFeeBasisPoints, &DEFAULT_BASE_FEE_BPS);
+        e.storage()
+            .instance()
+            .set(&DataKey::FeeUpdateTimelockLedgers, &DEFAULT_FEE_TIMELOCK_LEDGERS);
         Ok(())
     }
 
@@ -191,12 +243,12 @@ impl LiquidityPool {
         e.storage()
             .instance()
             .get(&DataKey::FeeBasisPoints)
-            .unwrap_or(30)
+            .unwrap_or(DEFAULT_BASE_FEE_BPS)
     }
 
     /// Admin-only: update the swap fee. Valid range: 0–100 bps (0%–1%).
     pub fn set_fee(e: Env, fee_bps: i128) -> Result<(), Error> {
-        if !(0..=100).contains(&fee_bps) {
+        if !(0..=MAX_FEE_BPS).contains(&fee_bps) {
             return Err(Error::InvalidFee);
         }
         let admin: Address = e
@@ -209,10 +261,13 @@ impl LiquidityPool {
             .storage()
             .instance()
             .get(&DataKey::FeeBasisPoints)
-            .unwrap_or(30);
+            .unwrap_or(DEFAULT_BASE_FEE_BPS);
         e.storage()
             .instance()
             .set(&DataKey::FeeBasisPoints, &fee_bps);
+        e.storage()
+            .instance()
+            .set(&DataKey::BaseFeeBasisPoints, &fee_bps);
         e.events().publish(
             (String::from_str(&e, "fee_changed"), admin.clone()),
             FeeChangedEvent {
@@ -222,6 +277,180 @@ impl LiquidityPool {
             },
         );
         Ok(())
+    }
+
+    /// Admin-only: configure external oracle and timelock parameters.
+    pub fn configure_fee_oracle(
+        e: Env,
+        oracle: Address,
+        base_fee_bps: i128,
+        timelock_ledgers: u32,
+    ) -> Result<(), Error> {
+        if !(0..=MAX_FEE_BPS).contains(&base_fee_bps) {
+            return Err(Error::InvalidFee);
+        }
+        let admin: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        e.storage().instance().set(&DataKey::OracleAddress, &oracle);
+        e.storage()
+            .instance()
+            .set(&DataKey::BaseFeeBasisPoints, &base_fee_bps);
+        e.storage()
+            .instance()
+            .set(&DataKey::FeeUpdateTimelockLedgers, &timelock_ledgers);
+
+        Ok(())
+    }
+
+    pub fn get_last_volatility_bps(e: Env) -> i128 {
+        e.storage()
+            .instance()
+            .get(&DataKey::LastVolatilityBps)
+            .unwrap_or(0)
+    }
+
+    pub fn get_pending_fee_update(e: Env) -> Option<PendingFeeUpdate> {
+        e.storage().instance().get(&DataKey::PendingFeeUpdate)
+    }
+
+    /// Pulls price from oracle, computes volatility and schedules a timelocked
+    /// fee update when the target fee differs from current fee.
+    pub fn sync_fee_from_oracle(e: Env) -> Result<Option<PendingFeeUpdate>, Error> {
+        let oracle: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::OracleAddress)
+            .ok_or(Error::OracleNotConfigured)?;
+
+        let oracle_client = PriceOracleClient::new(&e, &oracle);
+        let current_price = oracle_client.latest_price();
+        if current_price <= 0 {
+            return Err(Error::InvalidOraclePrice);
+        }
+
+        let previous_price: Option<i128> = e.storage().instance().get(&DataKey::LastOraclePrice);
+        e.storage()
+            .instance()
+            .set(&DataKey::LastOraclePrice, &current_price);
+
+        let prev = match previous_price {
+            Some(p) if p > 0 => p,
+            _ => {
+                e.storage().instance().set(&DataKey::LastVolatilityBps, &0i128);
+                return Ok(None);
+            }
+        };
+
+        let price_delta = if current_price >= prev {
+            current_price - prev
+        } else {
+            prev - current_price
+        };
+        let volatility_bps = price_delta
+            .checked_mul(10_000)
+            .ok_or(Error::InvalidOraclePrice)?
+            / prev;
+
+        e.storage()
+            .instance()
+            .set(&DataKey::LastVolatilityBps, &volatility_bps);
+
+        let base_fee_bps: i128 = e
+            .storage()
+            .instance()
+            .get(&DataKey::BaseFeeBasisPoints)
+            .unwrap_or(DEFAULT_BASE_FEE_BPS);
+        let target_fee = Self::target_fee_from_volatility(base_fee_bps, volatility_bps);
+        let current_fee = Self::get_fee(e.clone());
+        if target_fee == current_fee {
+            return Ok(None);
+        }
+
+        let timelock_ledgers: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::FeeUpdateTimelockLedgers)
+            .unwrap_or(DEFAULT_FEE_TIMELOCK_LEDGERS);
+        let execute_after = e.ledger().sequence().saturating_add(timelock_ledgers);
+        let pending = PendingFeeUpdate {
+            new_fee_bps: target_fee,
+            executable_after_ledger: execute_after,
+            based_on_volatility_bps: volatility_bps,
+        };
+        e.storage().instance().set(&DataKey::PendingFeeUpdate, &pending);
+        let scheduled_by = e.current_contract_address();
+        e.events().publish(
+            (String::from_str(&e, "fee_update_scheduled"), scheduled_by.clone()),
+            FeeUpdateScheduledEvent {
+                scheduled_by,
+                old_fee_bps: current_fee,
+                new_fee_bps: target_fee,
+                executable_after_ledger: execute_after,
+                volatility_bps,
+            },
+        );
+
+        Ok(Some(pending))
+    }
+
+    /// Applies a previously scheduled fee update after timelock elapses.
+    pub fn execute_fee_update(e: Env) -> Result<i128, Error> {
+        let pending: PendingFeeUpdate = e
+            .storage()
+            .instance()
+            .get(&DataKey::PendingFeeUpdate)
+            .ok_or(Error::NoPendingFeeUpdate)?;
+
+        if e.ledger().sequence() < pending.executable_after_ledger {
+            return Err(Error::TimelockNotElapsed);
+        }
+        if !(0..=MAX_FEE_BPS).contains(&pending.new_fee_bps) {
+            return Err(Error::InvalidFee);
+        }
+
+        let admin: Address = e
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        let old_fee = Self::get_fee(e.clone());
+        e.storage()
+            .instance()
+            .set(&DataKey::FeeBasisPoints, &pending.new_fee_bps);
+        e.storage().instance().remove(&DataKey::PendingFeeUpdate);
+
+        e.events().publish(
+            (String::from_str(&e, "fee_changed"), admin.clone()),
+            FeeChangedEvent {
+                admin,
+                old_fee_bps: old_fee,
+                new_fee_bps: pending.new_fee_bps,
+            },
+        );
+
+        Ok(pending.new_fee_bps)
+    }
+
+    fn target_fee_from_volatility(base_fee_bps: i128, volatility_bps: i128) -> i128 {
+        let dynamic_fee = if volatility_bps >= HIGH_VOLATILITY_THRESHOLD_BPS {
+            HIGH_VOLATILITY_FEE_BPS
+        } else if volatility_bps >= MEDIUM_VOLATILITY_THRESHOLD_BPS {
+            MEDIUM_VOLATILITY_FEE_BPS
+        } else if volatility_bps >= LOW_VOLATILITY_THRESHOLD_BPS {
+            LOW_VOLATILITY_FEE_BPS
+        } else {
+            base_fee_bps
+        };
+        if dynamic_fee > MAX_FEE_BPS {
+            MAX_FEE_BPS
+        } else {
+            dynamic_fee
+        }
     }
 
     /// Admin-only: pause or unpause the pool.

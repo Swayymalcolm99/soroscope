@@ -157,8 +157,6 @@ struct AppState {
     insights_engine: InsightsEngine,
     /// Simulation timeout for RPC requests
     simulation_timeout: std::time::Duration,
-    /// Job queue for background task processing
-    job_queue: JobQueue,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -286,6 +284,27 @@ pub struct AnalyzeWasmRequest {
     /// Optional function arguments (void | true | false | integers | symbols).
     #[schema(example = "[]")]
     pub args: Option<Vec<String>>,
+}
+
+/// Request body for the WASM profiling endpoint.
+#[derive(Debug, Deserialize)]
+pub struct ProfileWasmRequest {
+    /// Base64-encoded WASM binary.
+    pub wasm_bytes: String,
+    /// Name of the exported function to invoke.
+    pub function_name: String,
+    /// Optional function arguments.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// Response body for the WASM profiling endpoint.
+#[derive(Debug, Serialize)]
+pub struct ProfileResponse {
+    /// Flamegraph and per-function counts.
+    pub profile: simulation::ProfileResult,
+    /// Standard Soroban resource metrics (CPU, RAM, etc.).
+    pub resources: simulation::SorobanResources,
 }
 
 /// Convert a `SimulationResult` (library type) into the API `ResourceReport`.
@@ -496,6 +515,45 @@ async fn analyze_wasm(
     };
 
     Ok(Json(to_report(&sim_result, &state.insights_engine)))
+}
+
+async fn analyze_wasm_profile(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ProfileWasmRequest>,
+) -> Result<Json<ProfileResponse>, AppError> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+    tracing::info!(
+        function_name = %payload.function_name,
+        "Received WASM profile request"
+    );
+
+    let wasm_bytes = BASE64
+        .decode(&payload.wasm_bytes)
+        .map_err(|e| AppError::BadRequest(format!("Invalid base64 WASM data: {}", e)))?;
+
+    let function_name = payload.function_name.clone();
+    let args = payload.args.clone();
+
+    let result = tokio::time::timeout(
+        state.simulation_timeout,
+        tokio::task::spawn_blocking(move || {
+            simulation::profile_contract_with_flamegraph(wasm_bytes, function_name, args)
+        }),
+    )
+    .await
+    .map_err(|_| {
+        AppError::Internal(format!(
+            "Profiling request timed out after {} seconds",
+            state.simulation_timeout.as_secs()
+        ))
+    })?
+    .map_err(|e| AppError::Internal(format!("Profiling task panicked: {}", e)))?
+    .map_err(|e| AppError::BadRequest(format!("Profiling failed: {}", e)))?;
+
+    let (resources, profile) = result;
+
+    Ok(Json(ProfileResponse { profile, resources }))
 }
 
 #[utoipa::path(
@@ -871,6 +929,7 @@ async fn main() {
     let protected = Router::new()
         .route("/analyze", post(analyze))
         .route("/analyze/wasm", post(analyze_wasm))
+        .route("/analyze/wasm/profile", post(analyze_wasm_profile))
         .route("/analyze/optimize-limits", post(optimize_limits))
         .route("/analyze/compare", post(compare_handler))
         .route_layer(middleware::from_fn(auth::auth_middleware));
@@ -1032,4 +1091,195 @@ mod tests {
         // Default should be 30 seconds
         assert_eq!(engine.timeout(), Duration::from_secs(30));
     }
+    // ── API integration tests for /analyze/wasm/profile ──────────────────────
+
+    /// Build a minimal valid WASM module with one exported function `add` that
+    /// returns i32 (i32.const 42; end). Mirrors the helper in simulation.rs.
+    fn minimal_wasm_bytes() -> Vec<u8> {
+        use wasm_encoder::{
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection,
+            Module, TypeSection, ValType,
+        };
+        let mut module = Module::new();
+        let mut types = TypeSection::new();
+        types.ty().function([], [ValType::I32]);
+        module.section(&types);
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        module.section(&functions);
+        let mut exports = ExportSection::new();
+        exports.export("add", ExportKind::Func, 0);
+        module.section(&exports);
+        let mut codes = CodeSection::new();
+        let mut f = Function::new(vec![]);
+        f.instruction(&wasm_encoder::Instruction::I32Const(42));
+        f.instruction(&wasm_encoder::Instruction::End);
+        codes.function(&f);
+        module.section(&codes);
+        module.finish()
+    }
+
+    fn build_test_app() -> Router {
+        use std::sync::Arc;
+        let app_state = Arc::new(AppState {
+            engine: SimulationEngine::new("https://test.example.com".to_string()),
+            cache: SimulationCache::new(),
+            insights_engine: InsightsEngine::new(),
+            simulation_timeout: std::time::Duration::from_secs(30),
+        });
+        let auth_state = Arc::new(auth::AuthState::new(
+            "test-secret".to_string(),
+            None,
+            "Test SDF Network ; September 2015".to_string(),
+        ));
+        let protected = Router::new()
+            .route("/analyze/wasm/profile", post(analyze_wasm_profile))
+            .route_layer(middleware::from_fn(auth::auth_middleware));
+        Router::new()
+            .merge(protected)
+            .layer(Extension(auth_state))
+            .with_state(app_state)
+    }
+
+    fn make_jwt(secret: &str) -> String {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+        use serde_json::json;
+        let claims = json!({
+            "sub": "test-user",
+            "exp": 9999999999u64,
+        });
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_profile_endpoint_valid_request_returns_200() {
+        use axum::body::Body;
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app = build_test_app();
+        let wasm_b64 = BASE64.encode(minimal_wasm_bytes());
+        let body = serde_json::json!({
+            "wasm_bytes": wasm_b64,
+            "function_name": "add",
+            "args": []
+        });
+        let token = make_jwt("test-secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/analyze/wasm/profile")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", token))
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_profile_endpoint_invalid_base64_returns_400() {
+        use axum::body::Body;
+        use http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app = build_test_app();
+        let body = serde_json::json!({
+            "wasm_bytes": "!!!not-valid-base64!!!",
+            "function_name": "add",
+            "args": []
+        });
+        let token = make_jwt("test-secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/analyze/wasm/profile")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", token))
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_profile_endpoint_invalid_wasm_returns_400() {
+        use axum::body::Body;
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app = build_test_app();
+        let bad_wasm = BASE64.encode(b"this is not wasm");
+        let body = serde_json::json!({
+            "wasm_bytes": bad_wasm,
+            "function_name": "add",
+            "args": []
+        });
+        let token = make_jwt("test-secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/analyze/wasm/profile")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", token))
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_profile_endpoint_unknown_function_returns_400() {
+        use axum::body::Body;
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app = build_test_app();
+        let wasm_b64 = BASE64.encode(minimal_wasm_bytes());
+        let body = serde_json::json!({
+            "wasm_bytes": wasm_b64,
+            "function_name": "nonexistent_function",
+            "args": []
+        });
+        let token = make_jwt("test-secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/analyze/wasm/profile")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", token))
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_profile_endpoint_no_jwt_returns_401() {
+        use axum::body::Body;
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let app = build_test_app();
+        let wasm_b64 = BASE64.encode(minimal_wasm_bytes());
+        let body = serde_json::json!({
+            "wasm_bytes": wasm_b64,
+            "function_name": "add",
+            "args": []
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/analyze/wasm/profile")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
 }

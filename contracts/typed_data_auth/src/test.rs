@@ -2,7 +2,7 @@
 
 use crate::{Domain, Transfer, TypedDataAuth};
 use soroban_sdk::testutils::{Address as _, BytesN as _};
-use soroban_sdk::{crypto::Signature, testutils::ed25519::Sign, Address, BytesN, Env, String};
+use soroban_sdk::{Address, BytesN, Env, String};
 
 #[test]
 fn test_authorize_transfer_with_valid_signature() {

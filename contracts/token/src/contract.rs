@@ -1,9 +1,7 @@
 use crate::admin::{has_administrator, read_administrator, write_administrator};
 use crate::allowance::{read_allowance, spend_allowance, write_allowance};
 use crate::balance::{read_balance, receive_balance, spend_balance};
-use crate::metadata::{
-    read_decimal, read_name, read_symbol, write_decimal, write_name, write_symbol,
-};
+use crate::metadata::{read_decimal, read_name, read_symbol, write_metadata};
 use soroban_sdk::{contract, contractimpl, Address, Env, String};
 
 pub trait TokenTrait {
@@ -32,15 +30,14 @@ impl TokenTrait for Token {
             panic!("already initialized");
         }
         write_administrator(&e, &admin);
-        write_decimal(&e, decimal);
-        write_name(&e, &name);
-        write_symbol(&e, &symbol);
+        // One write instead of three separate writes for name/symbol/decimals.
+        write_metadata(&e, &name, &symbol, decimal);
     }
 
     fn mint(e: Env, to: Address, amount: i128) {
         let admin = read_administrator(&e);
         admin.require_auth();
-        e.storage().instance().extend_ttl(100, 100); // Simple maintenance of instance storage
+        e.storage().instance().extend_ttl(100, 100);
 
         receive_balance(&e, to, amount);
     }

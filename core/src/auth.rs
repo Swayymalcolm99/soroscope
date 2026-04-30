@@ -1,7 +1,9 @@
 use crate::errors::AppError;
 use axum::{extract::Request, http::header, middleware::Next, response::Response, Extension, Json};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use ed25519_dalek::{Signature as Ed25519Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{
+    Keypair, PublicKey, SecretKey, Signature as Ed25519Signature, Signer, Verifier,
+};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -22,7 +24,7 @@ const WEB_AUTH_DOMAIN: &str = "soroscope";
 
 pub struct AuthState {
     pub jwt_secret: String,
-    pub signing_key: SigningKey,
+    pub signing_key: Keypair,
     pub server_public_key: [u8; 32],
     pub network_passphrase: String,
 }
@@ -33,15 +35,18 @@ impl AuthState {
         sep10_seed: Option<[u8; 32]>,
         network_passphrase: String,
     ) -> Self {
-        let signing_key = match sep10_seed {
-            Some(seed) => SigningKey::from_bytes(&seed),
+        let seed = match sep10_seed {
+            Some(seed) => seed,
             None => {
                 let mut seed = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut seed);
-                SigningKey::from_bytes(&seed)
+                seed
             }
         };
-        let server_public_key = signing_key.verifying_key().to_bytes();
+        let secret = SecretKey::from_bytes(&seed).expect("ed25519 secret key");
+        let public = PublicKey::from(&secret);
+        let signing_key = Keypair { secret, public };
+        let server_public_key = signing_key.public.to_bytes();
         Self {
             jwt_secret,
             signing_key,
@@ -265,12 +270,12 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
 
     for ds in sigs {
         let sig_bytes: &[u8] = ds.signature.as_ref();
-        let Ok(sig) = Ed25519Signature::from_slice(sig_bytes) else {
+        let Ok(sig) = Ed25519Signature::from_bytes(sig_bytes) else {
             continue;
         };
 
         if ds.hint.0 == server_hint {
-            if let Ok(vk) = VerifyingKey::from_bytes(&state.server_public_key) {
+            if let Ok(vk) = PublicKey::from_bytes(&state.server_public_key) {
                 if vk.verify(&hash, &sig).is_ok() {
                     server_ok = true;
                 }
@@ -278,7 +283,7 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
         }
 
         if ds.hint.0 == client_hint {
-            if let Ok(vk) = VerifyingKey::from_bytes(&client_key) {
+            if let Ok(vk) = PublicKey::from_bytes(&client_key) {
                 if vk.verify(&hash, &sig).is_ok() {
                     client_ok = true;
                 }

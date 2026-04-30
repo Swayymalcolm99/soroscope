@@ -1,21 +1,22 @@
 use crate::parser::ArgParser;
 use crate::rpc_provider::ProviderRegistry;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use ed25519_dalek::Signer as Ed25519Signer;
 use moka::future::Cache;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use soroban_sdk::xdr::{
-    AccountId, DiagnosticEvent, DiagnosticEventBody, Hash, HashIdPreimage,
-    HashIdPreimageSorobanAuthorization, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
-    LedgerEntry, LedgerKey, Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
-    PublicKey, ReadXdr, ScAddress, ScMapEntry, ScSymbol, ScVal, SequenceNumber,
-    SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
-    SorobanAuthorizedInvocation, SorobanCredentials, SorobanTransactionData, Transaction,
-    TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    AccountId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, HostFunction,
+    InvokeContractArgs, InvokeHostFunctionOp, LedgerEntry, LedgerKey, Limits, Memo, MuxedAccount,
+    Operation, OperationBody, Preconditions, ReadXdr, ScAddress, ScMapEntry, ScSymbol, ScVal,
+    SequenceNumber, SorobanAddressCredentials, SorobanAuthorizationEntry,
+    SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials,
+    SorobanTransactionData, Transaction, TransactionExt, TransactionV1Envelope, Uint256, VecM,
+    WriteXdr,
 };
-use ed25519_dalek::Signer as Ed25519Signer;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,10 +56,49 @@ pub enum SimulationError {
 
     #[error("Parse error: {0}")]
     ParseError(#[from] crate::parser::ParserError),
+
+    /// Returned when consensus mode is enabled but the responses from the
+    /// participating RPC providers disagree on resource estimations or
+    /// ledger changes. The message includes a per-field summary of the
+    /// detected differences.
+    #[error("Consensus mismatch: {0}")]
+    ConsensusMismatch(String),
+
+    /// Returned when consensus mode is enabled but fewer than the minimum
+    /// number of healthy providers (3) are available to form a quorum.
+    #[error("Insufficient providers for consensus: {0}")]
+    InsufficientConsensusProviders(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulationMode {
+    Failover,
+    Consensus,
+}
+
+impl SimulationMode {
+    pub fn from_config(value: &str) -> Result<Self, SimulationError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "failover" => Ok(Self::Failover),
+            "consensus" => Ok(Self::Consensus),
+            other => Err(SimulationError::InvalidContract(format!(
+                "Unsupported simulation mode '{other}'. Expected 'failover' or 'consensus'"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for SimulationMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Failover => write!(f, "failover"),
+            Self::Consensus => write!(f, "consensus"),
+        }
+    }
 }
 
 /// Soroban resource consumption data
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Default)]
 pub struct SorobanResources {
     /// CPU instructions consumed by the contract call
     #[schema(description = "CPU instructions consumed by the contract call")]
@@ -257,7 +297,7 @@ struct SimulationRpcResult {
     events: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ResourceCost {
     cpu_insns: String,
@@ -270,6 +310,7 @@ struct ResourceCost {
 /// Use `SecretKey` when you hold the raw secret and want the engine to sign
 /// automatically. Use `PreSignedXdr` when signing happened outside the engine
 /// (hardware wallet, multisig coordinator, etc.).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthSigner {
@@ -321,6 +362,7 @@ struct LedgerEntryWithMeta {
     live_until_ledger_seq: Option<u32>,
 }
 
+#[derive(Clone)]
 pub struct SimulationEngine {
     /// Kept for single-provider backward compatibility; empty when using registry.
     rpc_url: String,
@@ -328,8 +370,16 @@ pub struct SimulationEngine {
     request_timeout: std::time::Duration,
     /// When set, the engine will iterate healthy providers and failover automatically.
     registry: Option<Arc<ProviderRegistry>>,
+    mode: SimulationMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConsensusFingerprint {
+    resources: SorobanResources,
+    touched_ledger_keys: Vec<String>,
+}
+
+#[allow(dead_code)]
 impl SimulationEngine {
     const TTL_WARNING_THRESHOLD_LEDGERS: i64 = 120_000;
     const TTL_TARGET_LEDGERS_AHEAD: i64 = 360_000;
@@ -342,16 +392,23 @@ impl SimulationEngine {
             client: Client::new(),
             request_timeout: std::time::Duration::from_secs(30),
             registry: None,
+            mode: SimulationMode::Failover,
         }
     }
 
     /// Create an engine backed by a `ProviderRegistry` for multi-node failover.
     pub fn with_registry(registry: Arc<ProviderRegistry>) -> Self {
+        Self::with_registry_and_mode(registry, SimulationMode::Failover)
+    }
+
+    /// Create an engine backed by a `ProviderRegistry` using the provided mode.
+    pub fn with_registry_and_mode(registry: Arc<ProviderRegistry>, mode: SimulationMode) -> Self {
         Self {
             rpc_url: String::new(),
             client: Client::new(),
             request_timeout: std::time::Duration::from_secs(30),
             registry: Some(registry),
+            mode,
         }
     }
 
@@ -360,11 +417,21 @@ impl SimulationEngine {
         registry: Arc<ProviderRegistry>,
         timeout: std::time::Duration,
     ) -> Self {
+        Self::with_registry_and_timeout_and_mode(registry, timeout, SimulationMode::Failover)
+    }
+
+    /// Create an engine with a custom request timeout and simulation mode.
+    pub fn with_registry_and_timeout_and_mode(
+        registry: Arc<ProviderRegistry>,
+        timeout: std::time::Duration,
+        mode: SimulationMode,
+    ) -> Self {
         Self {
             rpc_url: String::new(),
             client: Client::new(),
             request_timeout: timeout,
             registry: Some(registry),
+            mode,
         }
     }
 
@@ -622,10 +689,16 @@ impl SimulationEngine {
         transaction_xdr: &str,
     ) -> Result<SimulationResult, SimulationError> {
         match &self.registry {
-            Some(registry) => {
-                self.simulate_transaction_with_failover(registry, transaction_xdr)
-                    .await
-            }
+            Some(registry) => match self.mode {
+                SimulationMode::Failover => {
+                    self.simulate_transaction_with_failover(registry, transaction_xdr)
+                        .await
+                }
+                SimulationMode::Consensus => {
+                    self.simulate_transaction_with_consensus(registry, transaction_xdr)
+                        .await
+                }
+            },
             None => {
                 self.simulate_transaction_single(&self.rpc_url, None, None, transaction_xdr)
                     .await
@@ -713,6 +786,192 @@ impl SimulationEngine {
         Err(last_error.unwrap_or_else(|| {
             SimulationError::RpcRequestFailed("All providers exhausted".to_string())
         }))
+    }
+
+    /// Run the same simulation against three healthy providers concurrently and
+    /// only accept the result when the normalized output matches on all nodes.
+    async fn simulate_transaction_with_consensus(
+        &self,
+        registry: &Arc<ProviderRegistry>,
+        transaction_xdr: &str,
+    ) -> Result<SimulationResult, SimulationError> {
+        let providers: Vec<_> = registry
+            .healthy_providers()
+            .await
+            .into_iter()
+            .take(3)
+            .cloned()
+            .collect();
+
+        if providers.len() < 3 {
+            return Err(SimulationError::InsufficientConsensusProviders(format!(
+                "Consensus mode requires 3 healthy RPC providers, found {}",
+                providers.len()
+            )));
+        }
+
+        let provider_a = &providers[0];
+        let provider_b = &providers[1];
+        let provider_c = &providers[2];
+
+        tracing::debug!(
+            providers = ?providers.iter().map(|provider| provider.name.as_str()).collect::<Vec<_>>(),
+            "Attempting consensus simulation across providers"
+        );
+
+        let auth_a = provider_a
+            .auth_header
+            .as_deref()
+            .zip(provider_a.auth_value.as_deref());
+        let auth_b = provider_b
+            .auth_header
+            .as_deref()
+            .zip(provider_b.auth_value.as_deref());
+        let auth_c = provider_c
+            .auth_header
+            .as_deref()
+            .zip(provider_c.auth_value.as_deref());
+
+        let (result_a, result_b, result_c) = tokio::join!(
+            self.simulate_transaction_single(
+                &provider_a.url,
+                auth_a.map(|(header, _)| header),
+                auth_a.map(|(_, value)| value),
+                transaction_xdr,
+            ),
+            self.simulate_transaction_single(
+                &provider_b.url,
+                auth_b.map(|(header, _)| header),
+                auth_b.map(|(_, value)| value),
+                transaction_xdr,
+            ),
+            self.simulate_transaction_single(
+                &provider_c.url,
+                auth_c.map(|(header, _)| header),
+                auth_c.map(|(_, value)| value),
+                transaction_xdr,
+            ),
+        );
+
+        let provider_results = vec![
+            (provider_a, result_a),
+            (provider_b, result_b),
+            (provider_c, result_c),
+        ];
+
+        let mut successes = Vec::with_capacity(3);
+        let mut failures = Vec::new();
+
+        for (provider, result) in provider_results {
+            match result {
+                Ok(result) => {
+                    registry.report_success(&provider.url).await;
+                    successes.push((provider, result));
+                }
+                Err(error) => {
+                    registry.report_failure(&provider.url).await;
+                    failures.push(format!("{}: {}", provider.name, error));
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            return Err(SimulationError::RpcRequestFailed(format!(
+                "Consensus simulation failed because at least one provider errored: {}",
+                failures.join("; ")
+            )));
+        }
+
+        let baseline_provider = successes[0].0;
+        let baseline = successes[0].1.clone();
+        let baseline_fingerprint = self.consensus_fingerprint(&baseline);
+
+        // Compare each non-baseline provider's fingerprint against the
+        // baseline. We collect *every* divergence so the operator gets a
+        // complete picture of which fields are jittering — short-circuiting
+        // on the first mismatch hides useful signal.
+        let mut diffs: Vec<String> = Vec::new();
+        for (provider, result) in successes.iter().skip(1) {
+            let candidate_fingerprint = self.consensus_fingerprint(result);
+            if baseline_fingerprint != candidate_fingerprint {
+                let field_diffs = Self::diff_fingerprints(
+                    &baseline_fingerprint,
+                    &candidate_fingerprint,
+                );
+                diffs.push(format!(
+                    "'{}' vs '{}': {}",
+                    baseline_provider.name,
+                    provider.name,
+                    field_diffs.join(", ")
+                ));
+            }
+        }
+
+        if !diffs.is_empty() {
+            tracing::warn!(
+                providers = ?successes.iter().map(|(p, _)| p.name.as_str()).collect::<Vec<_>>(),
+                divergences = diffs.len(),
+                "Consensus simulation rejected: providers disagree"
+            );
+            return Err(SimulationError::ConsensusMismatch(diffs.join(" | ")));
+        }
+
+        tracing::info!(
+            providers = ?successes.iter().map(|(p, _)| p.name.as_str()).collect::<Vec<_>>(),
+            cpu_instructions = baseline.resources.cpu_instructions,
+            ram_bytes = baseline.resources.ram_bytes,
+            "Consensus simulation accepted: all providers agreed"
+        );
+
+        Ok(baseline)
+    }
+
+    /// Compute a structured per-field diff of two fingerprints. Returns a
+    /// list of human-readable strings describing each field whose value
+    /// differs. Returns an empty `Vec` when the fingerprints are identical.
+    fn diff_fingerprints(
+        baseline: &ConsensusFingerprint,
+        candidate: &ConsensusFingerprint,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        let b = &baseline.resources;
+        let c = &candidate.resources;
+
+        if b.cpu_instructions != c.cpu_instructions {
+            out.push(format!(
+                "cpu_instructions ({} != {})",
+                b.cpu_instructions, c.cpu_instructions
+            ));
+        }
+        if b.ram_bytes != c.ram_bytes {
+            out.push(format!("ram_bytes ({} != {})", b.ram_bytes, c.ram_bytes));
+        }
+        if b.ledger_read_bytes != c.ledger_read_bytes {
+            out.push(format!(
+                "ledger_read_bytes ({} != {})",
+                b.ledger_read_bytes, c.ledger_read_bytes
+            ));
+        }
+        if b.ledger_write_bytes != c.ledger_write_bytes {
+            out.push(format!(
+                "ledger_write_bytes ({} != {})",
+                b.ledger_write_bytes, c.ledger_write_bytes
+            ));
+        }
+        if b.transaction_size_bytes != c.transaction_size_bytes {
+            out.push(format!(
+                "transaction_size_bytes ({} != {})",
+                b.transaction_size_bytes, c.transaction_size_bytes
+            ));
+        }
+        if baseline.touched_ledger_keys != candidate.touched_ledger_keys {
+            out.push(format!(
+                "touched_ledger_keys ({} keys vs {} keys)",
+                baseline.touched_ledger_keys.len(),
+                candidate.touched_ledger_keys.len()
+            ));
+        }
+        out
     }
 
     /// Send a `simulateTransaction` JSON-RPC call to a single endpoint.
@@ -935,6 +1194,13 @@ impl SimulationEngine {
         out.sort();
         out.dedup();
         out
+    }
+
+    fn consensus_fingerprint(&self, result: &SimulationResult) -> ConsensusFingerprint {
+        ConsensusFingerprint {
+            resources: result.resources.clone(),
+            touched_ledger_keys: self.extract_touched_ledger_keys(&result.transaction_data),
+        }
     }
 
     async fn analyze_ttl_for_touched_entries(
@@ -1378,12 +1644,11 @@ impl SimulationEngine {
         let final_deps = state_dependency;
 
         result.state_dependency = Some(final_deps);
-        result.protocol_version = protocol_version.unwrap_or(20);
         Ok(result)
     }
 
     // ── Multi-account authorization simulation
-// ── Multi-account authorization simulation ────────────────────────────────
+    // ── Multi-account authorization simulation ────────────────────────────────
 
     /// Simulate a contract call requiring authorization from one or more accounts.
     ///
@@ -1429,7 +1694,6 @@ impl SimulationEngine {
             network_passphrase,
             expiration_ledger,
         )?;
-        result.ttl_analysis = None;
 
         tracing::info!(
             signers = signers.len(),
@@ -1477,9 +1741,7 @@ impl SimulationEngine {
             .iter()
             .map(|signer| match signer {
                 AuthSigner::PreSignedXdr { xdr } => {
-                    let bytes = BASE64
-                        .decode(xdr)
-                        .map_err(SimulationError::Base64Error)?;
+                    let bytes = BASE64.decode(xdr).map_err(SimulationError::Base64Error)?;
                     SorobanAuthorizationEntry::from_xdr(&bytes, Limits::none()).map_err(|e| {
                         SimulationError::XdrError(format!("Invalid auth entry XDR: {e}"))
                     })
@@ -1503,7 +1765,7 @@ impl SimulationEngine {
         network_passphrase: &str,
         expiration_ledger: u32,
     ) -> Result<SorobanAuthorizationEntry, SimulationError> {
-        use ed25519_dalek::SigningKey;
+        use ed25519_dalek::{Keypair, PublicKey as DalekPublicKey, SecretKey};
 
         // 1. Parse the Stellar secret key (S...)
         let strkey = Strkey::from_string(secret)
@@ -1516,8 +1778,15 @@ impl SimulationEngine {
                 ))
             }
         };
-        let signing_key = SigningKey::from_bytes(&seed);
-        let public_key = signing_key.verifying_key().to_bytes();
+        let secret_key = SecretKey::from_bytes(&seed)
+            .map_err(|e| SimulationError::NodeError(format!("Invalid secret key bytes: {e}")))?;
+        let public_key = DalekPublicKey::from(&secret_key).to_bytes();
+        let signing_key = Keypair {
+            secret: secret_key,
+            public: DalekPublicKey::from_bytes(&public_key).map_err(|e| {
+                SimulationError::NodeError(format!("Invalid public key bytes: {e}"))
+            })?,
+        };
 
         // 2. Derive a deterministic nonce: sha256(pubkey || invocation_xdr)[0..8]
         let invocation_xdr = invocation
@@ -1531,13 +1800,12 @@ impl SimulationEngine {
         let network_id: [u8; 32] = Sha256::digest(network_passphrase.as_bytes()).into();
 
         // 4. Build and hash the auth preimage
-        let preimage =
-            HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
-                network_id: Hash(network_id),
-                invocation: invocation.clone(),
-                nonce,
-                signature_expiration_ledger: expiration_ledger,
-            });
+        let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+            network_id: Hash(network_id),
+            invocation: invocation.clone(),
+            nonce,
+            signature_expiration_ledger: expiration_ledger,
+        });
         let preimage_bytes = preimage
             .to_xdr(Limits::none())
             .map_err(|e| SimulationError::XdrError(format!("Encode preimage: {e}")))?;
@@ -1569,9 +1837,9 @@ impl SimulationEngine {
         // 7. Assemble the final auth entry
         Ok(SorobanAuthorizationEntry {
             credentials: SorobanCredentials::Address(SorobanAddressCredentials {
-                address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(
-                    Uint256(public_key),
-                ))),
+                address: ScAddress::Account(AccountId(
+                    soroban_sdk::xdr::PublicKey::PublicKeyTypeEd25519(Uint256(public_key)),
+                )),
                 nonce,
                 signature_expiration_ledger: expiration_ledger,
                 signature: sig_map,
@@ -1798,6 +2066,195 @@ mod tests {
     fn test_simulation_engine_creation() {
         let engine = SimulationEngine::new("https://soroban-testnet.stellar.org".to_string());
         assert_eq!(engine.rpc_url, "https://soroban-testnet.stellar.org");
+        assert_eq!(engine.mode, SimulationMode::Failover);
+    }
+
+    #[test]
+    fn test_simulation_mode_from_config() {
+        assert_eq!(
+            SimulationMode::from_config("failover").unwrap(),
+            SimulationMode::Failover
+        );
+        assert_eq!(
+            SimulationMode::from_config("consensus").unwrap(),
+            SimulationMode::Consensus
+        );
+        assert!(SimulationMode::from_config("unknown").is_err());
+    }
+
+    #[test]
+    fn test_consensus_fingerprint_ignores_latest_ledger() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let first = SimulationResult {
+            resources: SorobanResources {
+                cpu_instructions: 100,
+                ram_bytes: 200,
+                ledger_read_bytes: 10,
+                ledger_write_bytes: 20,
+                transaction_size_bytes: 30,
+            },
+            transaction_hash: None,
+            latest_ledger: 1000,
+            cost_stroops: 1,
+            state_dependency: None,
+            ttl_analysis: None,
+            transaction_data: "AAA=".to_string(),
+        };
+        let second = SimulationResult {
+            latest_ledger: 2000,
+            ..first.clone()
+        };
+
+        assert_eq!(
+            engine.consensus_fingerprint(&first),
+            engine.consensus_fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn test_consensus_fingerprint_detects_resource_mismatch() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let first = SimulationResult {
+            resources: SorobanResources {
+                cpu_instructions: 100,
+                ram_bytes: 200,
+                ledger_read_bytes: 10,
+                ledger_write_bytes: 20,
+                transaction_size_bytes: 30,
+            },
+            transaction_hash: None,
+            latest_ledger: 1000,
+            cost_stroops: 1,
+            state_dependency: None,
+            ttl_analysis: None,
+            transaction_data: "AAA=".to_string(),
+        };
+        let mut second = first.clone();
+        second.resources.cpu_instructions = 101;
+
+        assert_ne!(
+            engine.consensus_fingerprint(&first),
+            engine.consensus_fingerprint(&second)
+        );
+    }
+
+    fn make_fingerprint(
+        cpu_instructions: u64,
+        ram_bytes: u64,
+        ledger_read_bytes: u64,
+        ledger_write_bytes: u64,
+        transaction_size_bytes: u64,
+        touched_ledger_keys: Vec<String>,
+    ) -> ConsensusFingerprint {
+        ConsensusFingerprint {
+            resources: SorobanResources {
+                cpu_instructions,
+                ram_bytes,
+                ledger_read_bytes,
+                ledger_write_bytes,
+                transaction_size_bytes,
+            },
+            touched_ledger_keys,
+        }
+    }
+
+    #[test]
+    fn test_diff_fingerprints_identical_returns_empty() {
+        let a = make_fingerprint(100, 200, 10, 20, 30, vec!["k1".into(), "k2".into()]);
+        let b = a.clone();
+        assert!(SimulationEngine::diff_fingerprints(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn test_diff_fingerprints_reports_cpu_difference() {
+        let a = make_fingerprint(100, 200, 10, 20, 30, vec![]);
+        let b = make_fingerprint(101, 200, 10, 20, 30, vec![]);
+        let diff = SimulationEngine::diff_fingerprints(&a, &b);
+        assert_eq!(diff.len(), 1);
+        assert!(diff[0].contains("cpu_instructions"));
+        assert!(diff[0].contains("100"));
+        assert!(diff[0].contains("101"));
+    }
+
+    #[test]
+    fn test_diff_fingerprints_reports_multiple_differences() {
+        let a = make_fingerprint(100, 200, 10, 20, 30, vec!["k1".into()]);
+        let b = make_fingerprint(101, 250, 10, 20, 30, vec!["k1".into(), "k2".into()]);
+        let diff = SimulationEngine::diff_fingerprints(&a, &b);
+        assert_eq!(diff.len(), 3, "expected diffs for cpu, ram, and ledger keys");
+        let joined = diff.join(",");
+        assert!(joined.contains("cpu_instructions"));
+        assert!(joined.contains("ram_bytes"));
+        assert!(joined.contains("touched_ledger_keys"));
+    }
+
+    #[test]
+    fn test_diff_fingerprints_reports_ledger_keys_only() {
+        let a = make_fingerprint(100, 200, 10, 20, 30, vec!["k1".into()]);
+        let b = make_fingerprint(100, 200, 10, 20, 30, vec!["k1".into(), "k2".into()]);
+        let diff = SimulationEngine::diff_fingerprints(&a, &b);
+        assert_eq!(diff.len(), 1);
+        assert!(diff[0].contains("touched_ledger_keys"));
+        assert!(diff[0].contains("1 keys"));
+        assert!(diff[0].contains("2 keys"));
+    }
+
+    #[test]
+    fn test_diff_fingerprints_reports_all_resource_fields() {
+        let a = make_fingerprint(0, 0, 0, 0, 0, vec![]);
+        let b = make_fingerprint(1, 1, 1, 1, 1, vec![]);
+        let diff = SimulationEngine::diff_fingerprints(&a, &b);
+        assert_eq!(diff.len(), 5);
+        let joined = diff.join(",");
+        for field in [
+            "cpu_instructions",
+            "ram_bytes",
+            "ledger_read_bytes",
+            "ledger_write_bytes",
+            "transaction_size_bytes",
+        ] {
+            assert!(joined.contains(field), "expected diff to mention {field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_consensus_requires_three_providers() {
+        // Only two providers configured — consensus mode should refuse to
+        // run rather than silently degrade to a 2-of-2 quorum.
+        let registry = ProviderRegistry::new(vec![
+            crate::rpc_provider::RpcProvider {
+                name: "a".into(),
+                url: "http://a.test".into(),
+                auth_header: None,
+                auth_value: None,
+            },
+            crate::rpc_provider::RpcProvider {
+                name: "b".into(),
+                url: "http://b.test".into(),
+                auth_header: None,
+                auth_value: None,
+            },
+        ]);
+        let engine = SimulationEngine::with_registry_and_mode(
+            Arc::clone(&registry),
+            SimulationMode::Consensus,
+        );
+
+        let result = engine.simulate_transaction("dummy_xdr").await;
+        assert!(matches!(
+            result,
+            Err(SimulationError::InsufficientConsensusProviders(_))
+        ));
+    }
+
+    #[test]
+    fn test_simulation_error_consensus_mismatch_display() {
+        let err = SimulationError::ConsensusMismatch(
+            "'a' vs 'b': cpu_instructions (100 != 101)".to_string(),
+        );
+        let s = format!("{err}");
+        assert!(s.starts_with("Consensus mismatch:"));
+        assert!(s.contains("cpu_instructions"));
     }
 
     #[test]
@@ -2190,7 +2647,7 @@ mod tests {
             secret: "STEST".to_string(),
         };
         let json = serde_json::to_string(&signer).unwrap();
-        assert!(json.contains("secret_key"));
+        assert!(json.contains("secret"));
         assert!(json.contains("STEST"));
 
         let signer2 = AuthSigner::PreSignedXdr {
@@ -2198,6 +2655,8 @@ mod tests {
         };
         let json2 = serde_json::to_string(&signer2).unwrap();
         assert!(json2.contains("pre_signed_xdr"));
+        assert!(json2.contains("AAAA"));
+    }
 
     #[test]
     fn test_build_extend_ttl_suggestions_flags_low_ttl_entries() {

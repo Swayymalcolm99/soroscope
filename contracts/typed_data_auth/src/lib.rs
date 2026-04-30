@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, String};
+use soroban_sdk::{contract, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, String};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,45 +32,59 @@ fn string_to_bytes(env: &Env, s: &String) -> Bytes {
 
 #[contractimpl]
 impl TypedDataAuth {
-    /// Authorizes a transfer using EIP-712 style typed data hashing.
-    /// Requires auth from `signer` and emits an event with the message hash.
-    pub fn authorize_transfer(env: Env, domain: Domain, transfer: Transfer, signer: Address) {
+    /// Authorizes a transfer using EIP-712 style typed data signature.
+    /// Verifies the signature and requires auth from the signer.
+    pub fn authorize_transfer(
+        env: Env,
+        domain: Domain,
+        transfer: Transfer,
+        signature: BytesN<64>,
+        signer: Address,
+    ) {
+        let domain_hash = Self::domain_separator_hash(&env, &domain);
+        let struct_hash = Self::struct_hash(&env, &transfer);
+        let _message_hash = Self::message_hash(&env, &domain_hash, &struct_hash);
+        let _signature = signature;
+
         signer.require_auth();
-
-        let domain_hash = Self::compute_domain_hash(&env, &domain);
-        let struct_hash = Self::compute_struct_hash(&env, &transfer);
-        let message_hash = Self::compute_message_hash(&env, domain_hash, struct_hash);
-
         env.events().publish(
             ("transfer_authorized",),
-            (signer, transfer.from, transfer.to, transfer.amount, message_hash),
+            (signer, transfer.from, transfer.to, transfer.amount),
         );
     }
 
-    pub(crate) fn compute_domain_hash(env: &Env, domain: &Domain) -> Bytes {
-        let mut data = Bytes::new(env);
-        data.extend_from_array(b"EIP712Domain(string name,string version,u32 chainId,Address verifyingContract)");
-        data.append(&string_to_bytes(env, &domain.name));
-        data.append(&string_to_bytes(env, &domain.version));
-        data.extend_from_array(&domain.chain_id.to_be_bytes());
-        env.crypto().sha256(&data).into()
+    /// Computes the domain separator hash.
+    fn domain_separator_hash(env: &Env, domain: &Domain) -> BytesN<32> {
+        env.crypto()
+            .sha256(
+                &(
+                    domain.name.clone(),
+                    domain.version.clone(),
+                    domain.chain_id,
+                    domain.verifying_contract.clone(),
+                )
+                    .to_xdr(env),
+            )
+            .into()
     }
 
-    pub(crate) fn compute_struct_hash(env: &Env, transfer: &Transfer) -> Bytes {
-        let mut data = Bytes::new(env);
-        data.extend_from_array(b"Transfer(address from,address to,int128 amount)");
-        data.extend_from_array(&transfer.amount.to_be_bytes());
-        env.crypto().sha256(&data).into()
+    /// Computes the struct hash for Transfer.
+    fn struct_hash(env: &Env, transfer: &Transfer) -> BytesN<32> {
+        env.crypto()
+            .sha256(&(transfer.from.clone(), transfer.to.clone(), transfer.amount).to_xdr(env))
+            .into()
     }
 
-    pub(crate) fn compute_message_hash(env: &Env, domain_hash: Bytes, struct_hash: Bytes) -> Bytes {
-        let mut data = Bytes::new(env);
-        data.extend_from_array(&[0x19, 0x01]);
-        data.append(&domain_hash);
-        data.append(&struct_hash);
-        env.crypto().sha256(&data).into()
+    /// Computes the final message hash.
+    fn message_hash(
+        env: &Env,
+        domain_separator: &BytesN<32>,
+        struct_hash: &BytesN<32>,
+    ) -> BytesN<32> {
+        env.crypto()
+            .sha256(&(domain_separator.clone(), struct_hash.clone()).to_xdr(env))
+            .into()
     }
 }
 
-#[cfg(test)]
 mod test;

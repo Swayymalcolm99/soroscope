@@ -1,7 +1,8 @@
 use super::*;
 use soroban_sdk::{
+    contract, contractimpl, contracttype,
     testutils::{Address as _, Events, Ledger},
-    contract, contractimpl, contracttype, Address, Env, String as SorobanString, TryIntoVal,
+    Address, Env, String as SorobanString, TryIntoVal,
 };
 
 // Import Vec from alloc for no_std environment

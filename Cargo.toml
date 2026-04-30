@@ -17,4 +17,5 @@ exclude = [
     # (soroban-sdk=22). Tracked separately; upgrade the contract to the 22 API
     # to re-include.
     "contracts/typed_data_auth",
+    "contracts/twap_oracle",
 ]

@@ -3555,7 +3555,7 @@ dependencies = [
 name = "soroban-liquidity-pool-factory-contract"
 version = "0.1.0"
 dependencies = [
- "liquidity_pool",
+ "emergency_guard",
  "soroban-sdk",
  "soroban-token-contract",
 ]

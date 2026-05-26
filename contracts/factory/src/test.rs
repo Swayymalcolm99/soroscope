@@ -2,7 +2,12 @@
 extern crate std;
 use super::*;
 
-use soroban_sdk::{testutils::Address as _, Env};
+use emergency_guard::{EmergencyGuardAction, EmergencyGuardEvent, PauseType};
+use soroban_sdk::{
+    testutils::{Address as _, Events},
+    vec, Address, Env, String as SorobanString, TryIntoVal,
+};
+use std::vec::Vec;
 // use soroban_sdk::{token, BytesN};
 
 // Import the LiquidityPool contract to get its WASM bytes for testing
@@ -88,3 +93,191 @@ fn test_create_pair() {
 // let pool_address = factory_client.create_pair(&token_a, &token_b, &pool_hash);
 // assert!(pool_address != factory_id);
 */
+
+fn guard_events(env: &Env, contract_id: &Address, action: &str) -> Vec<EmergencyGuardEvent> {
+    let guard_topic = SorobanString::from_str(env, "EmergencyGuard");
+    let action_topic = SorobanString::from_str(env, action);
+
+    env.events()
+        .all()
+        .iter()
+        .filter_map(|(event_contract, topics, data)| {
+            if event_contract != *contract_id || topics.len() != 2 {
+                return None;
+            }
+
+            let topic_guard: SorobanString = topics.get(0)?.try_into_val(env).ok()?;
+            let topic_action: SorobanString = topics.get(1)?.try_into_val(env).ok()?;
+
+            if topic_guard == guard_topic && topic_action == action_topic {
+                data.try_into_val(env).ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn setup_guard(
+    env: &Env,
+) -> (
+    Address,
+    LiquidityPoolFactoryClient<'_>,
+    Address,
+    Address,
+    Address,
+) {
+    env.mock_all_auths();
+    let factory_id = env.register(LiquidityPoolFactory, ());
+    let factory_client = LiquidityPoolFactoryClient::new(env, &factory_id);
+    let admin1 = Address::generate(env);
+    let admin2 = Address::generate(env);
+    let admin3 = Address::generate(env);
+    let admins = vec![env, admin1.clone(), admin2.clone(), admin3.clone()];
+
+    factory_client.initialize_guard(&admins, &2);
+
+    (factory_id, factory_client, admin1, admin2, admin3)
+}
+
+#[test]
+fn test_initialize_guard_emits_standard_event() {
+    let env = Env::default();
+    let (factory_id, _client, _admin1, _admin2, _admin3) = setup_guard(&env);
+
+    let events = guard_events(&env, &factory_id, "initialized");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0],
+        EmergencyGuardEvent {
+            action: EmergencyGuardAction::Initialized,
+            admin: None,
+            operation: 0,
+            paused: false,
+            threshold: 2,
+            admin_count: 3,
+            approver_count: 0,
+        }
+    );
+}
+
+#[test]
+fn test_set_guard_pause_emits_standard_events() {
+    let env = Env::default();
+    let (factory_id, client, admin1, _admin2, _admin3) = setup_guard(&env);
+
+    client.set_guard_pause(&admin1, &PauseType::MINT, &true);
+    let events = guard_events(&env, &factory_id, "pause_set");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0],
+        EmergencyGuardEvent {
+            action: EmergencyGuardAction::PauseSet,
+            admin: Some(admin1.clone()),
+            operation: PauseType::MINT,
+            paused: true,
+            threshold: 2,
+            admin_count: 3,
+            approver_count: 1,
+        }
+    );
+
+    assert!(client.is_guard_paused(&PauseType::MINT));
+
+    client.set_guard_pause(&admin1, &PauseType::MINT, &false);
+    let events = guard_events(&env, &factory_id, "pause_set");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0],
+        EmergencyGuardEvent {
+            action: EmergencyGuardAction::PauseSet,
+            admin: Some(admin1),
+            operation: PauseType::MINT,
+            paused: false,
+            threshold: 2,
+            admin_count: 3,
+            approver_count: 1,
+        }
+    );
+}
+
+#[test]
+fn test_emergency_pause_and_resume_emit_standard_events() {
+    let env = Env::default();
+    let (factory_id, client, admin1, admin2, _admin3) = setup_guard(&env);
+    let approvers = vec![&env, admin1, admin2];
+
+    client.emergency_guard_pause(&approvers);
+    let emergency_events = guard_events(&env, &factory_id, "emergency_pause");
+    assert_eq!(emergency_events.len(), 1);
+    assert_eq!(
+        emergency_events[0],
+        EmergencyGuardEvent {
+            action: EmergencyGuardAction::EmergencyPause,
+            admin: None,
+            operation: u32::MAX,
+            paused: true,
+            threshold: 2,
+            admin_count: 3,
+            approver_count: 2,
+        }
+    );
+    assert!(client.is_guard_paused(&PauseType::MINT));
+
+    client.resume_guard(&approvers);
+    let resume_events = guard_events(&env, &factory_id, "resume");
+    assert_eq!(resume_events.len(), 1);
+    assert_eq!(
+        resume_events[0],
+        EmergencyGuardEvent {
+            action: EmergencyGuardAction::Resume,
+            admin: None,
+            operation: u32::MAX,
+            paused: false,
+            threshold: 2,
+            admin_count: 3,
+            approver_count: 2,
+        }
+    );
+    assert!(!client.is_guard_paused(&PauseType::MINT));
+}
+
+#[test]
+fn test_admin_guard_actions_emit_standard_events() {
+    let env = Env::default();
+    let (factory_id, client, admin1, admin2, admin3) = setup_guard(&env);
+    let approvers = vec![&env, admin1, admin2];
+    let admin4 = Address::generate(&env);
+
+    client.add_guard_admin(&approvers, &admin4);
+    let added_events = guard_events(&env, &factory_id, "admin_added");
+    assert_eq!(added_events.len(), 1);
+    assert_eq!(
+        added_events[0],
+        EmergencyGuardEvent {
+            action: EmergencyGuardAction::AdminAdded,
+            admin: Some(admin4),
+            operation: 0,
+            paused: false,
+            threshold: 2,
+            admin_count: 4,
+            approver_count: 2,
+        }
+    );
+
+    client.remove_guard_admin(&approvers, &admin3);
+    let removed_events = guard_events(&env, &factory_id, "admin_removed");
+    assert_eq!(removed_events.len(), 1);
+    assert_eq!(
+        removed_events[0],
+        EmergencyGuardEvent {
+            action: EmergencyGuardAction::AdminRemoved,
+            admin: Some(admin3),
+            operation: 0,
+            paused: false,
+            threshold: 2,
+            admin_count: 3,
+            approver_count: 2,
+        }
+    );
+}

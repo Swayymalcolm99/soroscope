@@ -9,6 +9,8 @@ import { ContractInteraction } from '../components/ContractInteraction';
 import { MOCK_CONTRACT_FUNCTIONS, generateMockResult, generateMockResourceCost } from '../lib/sorobantypes';
 import type { ContractFunction, InvocationResult } from '../lib/sorobantypes';
 import { UploadZone } from '../components/upload-zone';
+import { ResultViewerSkeleton } from '../components/ResultViewerSkeleton';
+import { NutritionLabelSkeleton } from '../components/NutritionLabelSkeleton';
 
 export default function Home() {
   const [contractId, setContractId] = useState('CAEZJVJ4N7P7GRUVD5NG5LYYH23AQHJUKQEUHW54LR5PGQX3V7FXD7Q');
@@ -235,20 +237,29 @@ export default function Home() {
               }}
             >
               {tab === 'explorer' ? (
-                <>
-                  <ResultViewer result={currentResult} />
-                  {currentResult?.resourceCost && (
+                loading ? (
+                  <>
+                    <ResultViewerSkeleton />
                     <div className="mt-4">
-                      <NutritionLabel
-                        cpu_instructions={currentResult.resourceCost.cpu_instructions}
-                        ram_bytes={currentResult.resourceCost.ram_bytes}
-                        ledger_read_bytes={currentResult.resourceCost.ledger_read_bytes}
-                        ledger_write_bytes={currentResult.resourceCost.ledger_write_bytes}
-                        transaction_size_bytes={currentResult.resourceCost.transaction_size_bytes}
-                      />
+                      <NutritionLabelSkeleton />
                     </div>
-                  )}
-                </>
+                  </>
+                ) : (
+                  <>
+                    <ResultViewer result={currentResult} />
+                    {currentResult?.resourceCost && (
+                      <div className="mt-4">
+                        <NutritionLabel
+                          cpu_instructions={currentResult.resourceCost.cpu_instructions}
+                          ram_bytes={currentResult.resourceCost.ram_bytes}
+                          ledger_read_bytes={currentResult.resourceCost.ledger_read_bytes}
+                          ledger_write_bytes={currentResult.resourceCost.ledger_write_bytes}
+                          transaction_size_bytes={currentResult.resourceCost.transaction_size_bytes}
+                        />
+                      </div>
+                    )}
+                  </>
+                )
               ) : (
                 <InvocationHistory onSelectResult={(result) => {
                   setCurrentResult(result);

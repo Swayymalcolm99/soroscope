@@ -1,5 +1,6 @@
 #![no_std]
 use emergency_guard::{EmergencyGuard, PauseType};
+use soroban_sdk::vec;
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
 
 #[cfg(test)]
@@ -100,27 +101,42 @@ pub struct AllowanceValue {
     pub expiration_ledger: u32,
 }
 
-/// Remaining DataKey variants – only per-user keys that cannot be grouped.
+/// Grouped pool state — stored as a single instance key to reduce storage footprint.
+#[contracttype]
+#[derive(Clone)]
+pub struct PoolState {
+    pub admin: Address,
+    pub token_a: Address,
+    pub token_b: Address,
+    pub reserve_a: i128,
+    pub reserve_b: i128,
+    pub total_shares: i128,
+    pub fee_bps: i128,
+}
+
+/// Storage keys.
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    TokenA,
-    TokenB,
-    ReserveA,
-    ReserveB,
-    ShareToken,
-    TotalShares,
+    /// Single-entry key for all grouped pool state.
+    Pool,
+    /// Per-user LP share balance (persistent storage).
     Balance(Address),
+    /// ERC-20-style allowances (persistent storage).
     Allowance(AllowanceDataKey),
-    Admin,
-    FeeBasisPoints,
-    Paused,
 }
 
-<<<<<<< Updated upstream
-fn check_not_paused(e: &Env, operation: u32) -> Result<(), Error> {
-    if EmergencyGuard::is_paused(e.clone(), operation) {
-=======
+fn load_pool(e: &Env) -> Result<PoolState, Error> {
+    e.storage()
+        .instance()
+        .get::<_, PoolState>(&DataKey::Pool)
+        .ok_or(Error::NotInitialized)
+}
+
+fn save_pool(e: &Env, pool: &PoolState) {
+    e.storage().instance().set(&DataKey::Pool, pool);
+}
+
 pub const MAX_FEE_BPS: i128 = 100;
 pub const DEFAULT_BASE_FEE_BPS: i128 = 30;
 pub const DEFAULT_FEE_TIMELOCK_LEDGERS: u32 = 120;
@@ -138,14 +154,8 @@ pub trait PriceOracle {
     fn latest_price(e: Env) -> i128;
 }
 
-fn check_paused(e: &Env) -> Result<(), Error> {
-    let paused: bool = e
-        .storage()
-        .instance()
-        .get(&DataKey::Paused)
-        .unwrap_or(false);
-    if paused {
->>>>>>> Stashed changes
+fn check_not_paused(e: &Env, operation: u32) -> Result<(), Error> {
+    if EmergencyGuard::is_paused(e.clone(), operation) {
         Err(Error::Paused)
     } else {
         Ok(())
@@ -186,26 +196,27 @@ impl LiquidityPool {
         if e.storage().instance().has(&DataKey::Pool) {
             return Err(Error::AlreadyInitialized);
         }
-        e.storage().instance().set(&DataKey::Admin, &admin);
-        e.storage().instance().set(&DataKey::TokenA, &token_a);
-        e.storage().instance().set(&DataKey::TokenB, &token_b);
-        e.storage().instance().set(&DataKey::ReserveA, &0i128);
-        e.storage().instance().set(&DataKey::ReserveB, &0i128);
-        e.storage().instance().set(&DataKey::TotalShares, &0i128);
-        // Default fee: 30 bps (≈ 0.3%)
-        e.storage()
-            .instance()
-            .set(&DataKey::FeeBasisPoints, &30i128);
+        admin.require_auth();
+        let pool = PoolState {
+            admin: admin.clone(),
+            token_a,
+            token_b,
+            reserve_a: 0,
+            reserve_b: 0,
+            total_shares: 0,
+            fee_bps: 30,
+        };
+        save_pool(&e, &pool);
+        // Initialize the EmergencyGuard with the admin as the sole approver.
+        EmergencyGuard::initialize(e.clone(), vec![&e, admin], 1)
+            .map_err(|_| Error::Unauthorized)?;
         Ok(())
     }
 
     /// Returns the current fee in basis points.
-    pub fn get_fee(e: Env) -> i128 {
-        // One read instead of one read per field.
-        e.storage()
-            .instance()
-            .get(&DataKey::FeeBasisPoints)
-            .unwrap_or(30)
+    pub fn get_fee(e: Env) -> Result<i128, Error> {
+        let pool = load_pool(&e)?;
+        Ok(pool.fee_bps)
     }
 
     /// Admin-only: update the swap fee. Valid range: 0–100 bps.
@@ -213,20 +224,11 @@ impl LiquidityPool {
         if !(0..=100).contains(&fee_bps) {
             return Err(Error::InvalidFee);
         }
-        let admin: Address = e
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
-        let old_fee: i128 = e
-            .storage()
-            .instance()
-            .get(&DataKey::FeeBasisPoints)
-            .unwrap_or(30);
-        e.storage()
-            .instance()
-            .set(&DataKey::FeeBasisPoints, &fee_bps);
+        let mut pool = load_pool(&e)?;
+        pool.admin.require_auth();
+        let old_fee = pool.fee_bps;
+        pool.fee_bps = fee_bps;
+        save_pool(&e, &pool);
         e.events().publish(
             (String::from_str(&e, "fee_changed"), pool.admin.clone()),
             FeeChangedEvent {
@@ -243,9 +245,19 @@ impl LiquidityPool {
         EmergencyGuard::set_pause(e, admin, operation, paused).map_err(|_| Error::Unauthorized)
     }
 
-    /// Admin-only: emergency pause all operations.
+    /// Admin-only: emergency pause all operations (requires multi-sig).
     pub fn emergency_pause(e: Env, approvers: Vec<Address>) -> Result<(), Error> {
         EmergencyGuard::emergency_pause(e, approvers).map_err(|_| Error::Unauthorized)
+    }
+
+    /// Admin-only: resume all paused operations (requires multi-sig).
+    pub fn resume_all(e: Env, approvers: Vec<Address>) -> Result<(), Error> {
+        EmergencyGuard::resume(e, approvers).map_err(|_| Error::Unauthorized)
+    }
+
+    /// Check whether a specific operation is currently paused.
+    pub fn is_paused(e: Env, operation: u32) -> bool {
+        EmergencyGuard::is_paused(e, operation)
     }
 
     /// Deposits token A and token B into the pool and mints LP shares.
@@ -253,6 +265,7 @@ impl LiquidityPool {
         check_not_paused(&e, PauseType::DEPOSIT)?;
         to.require_auth();
 
+        let mut pool = load_pool(&e)?;
         let client_a = soroban_sdk::token::Client::new(&e, &pool.token_a);
         let client_b = soroban_sdk::token::Client::new(&e, &pool.token_b);
         client_a.transfer(&to, &e.current_contract_address(), &amount_a);
@@ -309,6 +322,7 @@ impl LiquidityPool {
         check_not_paused(&e, PauseType::SWAP)?;
         to.require_auth();
 
+        let mut pool = load_pool(&e)?;
         let (reserve_in, reserve_out, token_in, token_out) = if buy_a {
             (pool.reserve_b, pool.reserve_a, pool.token_b.clone(), pool.token_a.clone())
         } else {
@@ -368,6 +382,7 @@ impl LiquidityPool {
         check_not_paused(&e, PauseType::WITHDRAW)?;
         to.require_auth();
 
+        let mut pool = load_pool(&e)?;
         let user_key = DataKey::Balance(to.clone());
         let current: i128 = e.storage().persistent().get(&user_key).unwrap_or(0);
         if share_amount > current {
@@ -411,6 +426,7 @@ impl LiquidityPool {
         check_not_paused(&e, PauseType::BURN)?;
         from.require_auth();
 
+        let mut pool = load_pool(&e)?;
         let user_key = DataKey::Balance(from.clone());
         let current: i128 = e.storage().persistent().get(&user_key).unwrap_or(0);
         if amount > current {
@@ -458,11 +474,7 @@ impl LiquidityPool {
     }
 
     pub fn total_supply(e: Env) -> i128 {
-        e.storage()
-            .instance()
-            .get::<_, PoolState>(&DataKey::Pool)
-            .map(|p| p.total_shares)
-            .unwrap_or(0)
+        load_pool(&e).map(|p| p.total_shares).unwrap_or(0)
     }
 
     pub fn transfer(e: Env, from: Address, to: Address, amount: i128) -> Result<(), Error> {

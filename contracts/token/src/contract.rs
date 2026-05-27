@@ -3,6 +3,14 @@ use crate::allowance::{read_allowance, spend_allowance, write_allowance};
 use crate::balance::{read_balance, receive_balance, spend_balance};
 use crate::metadata::{read_decimal, read_name, read_symbol, write_metadata};
 use soroban_sdk::{contract, contractimpl, Address, Env, String};
+use emergency_guard::{EmergencyGuard, PauseType};
+
+// Helper to enforce pause checks for token operations.
+fn ensure_not_paused(e: &Env, operation: u32) {
+    if EmergencyGuard::is_paused(e.clone(), operation) {
+        panic!("Operation paused");
+    }
+}
 
 pub trait TokenTrait {
     fn initialize(e: Env, admin: Address, decimal: u32, name: String, symbol: String);
@@ -35,6 +43,8 @@ impl TokenTrait for Token {
     }
 
     fn mint(e: Env, to: Address, amount: i128) {
+        // Ensure minting is not paused.
+        ensure_not_paused(&e, PauseType::MINT);
         let admin = read_administrator(&e);
         admin.require_auth();
         e.storage().instance().extend_ttl(100, 100);
@@ -68,6 +78,8 @@ impl TokenTrait for Token {
     }
 
     fn transfer(e: Env, from: Address, to: Address, amount: i128) {
+        // Ensure transfers are not paused.
+        ensure_not_paused(&e, PauseType::TRANSFER);
         from.require_auth();
         e.storage().instance().extend_ttl(100, 100);
 
@@ -76,6 +88,8 @@ impl TokenTrait for Token {
     }
 
     fn transfer_from(e: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        // Ensure transfer_from respects pause.
+        ensure_not_paused(&e, PauseType::TRANSFER);
         spender.require_auth();
         e.storage().instance().extend_ttl(100, 100);
 
@@ -85,6 +99,8 @@ impl TokenTrait for Token {
     }
 
     fn burn(e: Env, from: Address, amount: i128) {
+        // Ensure burning is not paused.
+        ensure_not_paused(&e, PauseType::BURN);
         from.require_auth();
         e.storage().instance().extend_ttl(100, 100);
 
@@ -92,6 +108,8 @@ impl TokenTrait for Token {
     }
 
     fn burn_from(e: Env, spender: Address, from: Address, amount: i128) {
+        // Ensure burn_from respects pause.
+        ensure_not_paused(&e, PauseType::BURN);
         spender.require_auth();
         e.storage().instance().extend_ttl(100, 100);
 

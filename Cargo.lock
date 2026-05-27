@@ -3631,6 +3631,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "soroban-staking-rewards"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+ "soroscope-error-codes",
+ "soroscope-math",
+]
+
+[[package]]
 name = "soroban-token-contract"
 version = "0.0.0"
 dependencies = [

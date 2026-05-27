@@ -1,6 +1,13 @@
 #![cfg(test)]
 
-use soroban_sdk::{testutils::Address as _, vec, Address, Env};
+use crate::{
+    AdminAddedEvent, AdminRemovedEvent, EmergencyGuard, EmergencyGuardClient, EmergencyPausedEvent,
+    GuardInitializedEvent, PauseStateChangedEvent, ResumedEvent,
+};
+use soroban_sdk::{
+    testutils::{Address as _, Events},
+    vec, Address, Env, String as SorobanString, TryIntoVal,
+};
 
 #[test]
 fn test_emergency_guard_initialization() {
@@ -78,4 +85,111 @@ fn test_multiple_pause_types() {
     assert!(!pause.is_paused(crate::PauseType::WITHDRAW));
     assert!(pause.is_paused(crate::PauseType::MINT));
     assert!(!pause.is_paused(crate::PauseType::BURN));
+}
+
+#[test]
+fn test_guard_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(EmergencyGuard, ());
+    let client = EmergencyGuardClient::new(&env, &contract_id);
+
+    let admin1 = Address::random(&env);
+    let admin2 = Address::random(&env);
+    let admin3 = Address::random(&env);
+    let admins = vec![&env, admin1.clone(), admin2.clone()];
+
+    client.initialize(&admins, &1);
+
+    let events = env.events().all();
+    let init_name = SorobanString::from_str(&env, "emergency_guard_initialized");
+    let init_event = events
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 1 && {
+                let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&env);
+                topic_str.map(|s| s == init_name).unwrap_or(false)
+            }
+        })
+        .expect("missing initialize event");
+    let init_data: GuardInitializedEvent = init_event.2.try_into_val(&env).unwrap();
+    assert_eq!(init_data.admins.len(), 2);
+    assert_eq!(init_data.threshold, 1);
+
+    client.set_pause(&admin1, &crate::PauseType::SWAP, &true);
+    client.emergency_pause(&vec![&env, admin1.clone()]);
+    client.resume(&vec![&env, admin1.clone()]);
+    client.add_admin(&vec![&env, admin1.clone()], &admin3);
+    client.remove_admin(&vec![&env, admin1.clone()], &admin3);
+
+    let events = env.events().all();
+
+    let pause_name = SorobanString::from_str(&env, "emergency_guard_pause_state_changed");
+    let emergency_name = SorobanString::from_str(&env, "emergency_guard_emergency_paused_all");
+    let resume_name = SorobanString::from_str(&env, "emergency_guard_resumed_all");
+    let add_name = SorobanString::from_str(&env, "emergency_guard_admin_added");
+    let remove_name = SorobanString::from_str(&env, "emergency_guard_admin_removed");
+
+    let pause_event = events
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 2 && {
+                let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&env);
+                topic_str.map(|s| s == pause_name).unwrap_or(false)
+            }
+        })
+        .expect("missing pause event");
+    let pause_data: PauseStateChangedEvent = pause_event.2.try_into_val(&env).unwrap();
+    assert_eq!(pause_data.admin, admin1);
+    assert_eq!(pause_data.operation, crate::PauseType::SWAP);
+    assert!(pause_data.paused);
+
+    let emergency_event = events
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 1 && {
+                let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&env);
+                topic_str.map(|s| s == emergency_name).unwrap_or(false)
+            }
+        })
+        .expect("missing emergency pause event");
+    let emergency_data: EmergencyPausedEvent = emergency_event.2.try_into_val(&env).unwrap();
+    assert_eq!(emergency_data.approvers.len(), 1);
+
+    let resume_event = events
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 1 && {
+                let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&env);
+                topic_str.map(|s| s == resume_name).unwrap_or(false)
+            }
+        })
+        .expect("missing resume event");
+    let resume_data: ResumedEvent = resume_event.2.try_into_val(&env).unwrap();
+    assert_eq!(resume_data.approvers.len(), 1);
+
+    let add_event = events
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 2 && {
+                let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&env);
+                topic_str.map(|s| s == add_name).unwrap_or(false)
+            }
+        })
+        .expect("missing admin add event");
+    let add_data: AdminAddedEvent = add_event.2.try_into_val(&env).unwrap();
+    assert_eq!(add_data.new_admin, admin3);
+
+    let remove_event = events
+        .iter()
+        .find(|(_, topics, _)| {
+            topics.len() == 2 && {
+                let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&env);
+                topic_str.map(|s| s == remove_name).unwrap_or(false)
+            }
+        })
+        .expect("missing admin remove event");
+    let remove_data: AdminRemovedEvent = remove_event.2.try_into_val(&env).unwrap();
+    assert_eq!(remove_data.admin, admin3);
 }

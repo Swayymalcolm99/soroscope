@@ -1,6 +1,9 @@
 #![no_std]
 
-use emergency_guard::{EmergencyGuardTrait, GuardError, PauseType};
+use emergency_guard::{
+    emit_admin_added, emit_admin_removed, emit_emergency_paused_all, emit_guard_initialized,
+    emit_pause_state_changed, emit_resumed_all, EmergencyGuardTrait, GuardError, PauseType,
+};
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
 
 #[cfg(test)]
@@ -530,6 +533,8 @@ impl LiquidityPool {
             save_pool(&e, &pool);
         }
 
+        emit_guard_initialized(&e, &admins, threshold);
+
         Ok(())
     }
 
@@ -553,6 +558,7 @@ impl LiquidityPool {
         }
 
         save_guard(&e, &guard);
+        emit_pause_state_changed(&e, &admin, operation, paused);
         Ok(())
     }
 
@@ -561,6 +567,7 @@ impl LiquidityPool {
         let mut guard = load_guard(&e);
         guard.pause_state = u32::MAX;
         save_guard(&e, &guard);
+        emit_emergency_paused_all(&e, &approvers);
         Ok(())
     }
 
@@ -569,6 +576,7 @@ impl LiquidityPool {
         let mut guard = load_guard(&e);
         guard.pause_state = 0;
         save_guard(&e, &guard);
+        emit_resumed_all(&e, &approvers);
         Ok(())
     }
 
@@ -595,6 +603,7 @@ impl LiquidityPool {
         if !guard.admins.iter().any(|a| a == new_admin) {
             guard.admins.push_back(new_admin.clone());
             save_guard(&e, &guard);
+            emit_admin_added(&e, &approvers, &new_admin);
         }
 
         Ok(())
@@ -625,6 +634,7 @@ impl LiquidityPool {
         let mut updated_guard = guard;
         updated_guard.admins = new_admins;
         save_guard(&e, &updated_guard);
+        emit_admin_removed(&e, &approvers, &admin);
 
         if let Ok(mut pool) = load_pool(&e) {
             if let Some(first_admin) = updated_guard.admins.get(0) {
@@ -643,6 +653,7 @@ impl LiquidityPool {
         let mut guard = load_or_init_guard_from_pool(&e, &pool);
         guard.pause_state = if paused { u32::MAX } else { 0 };
         save_guard(&e, &guard);
+        emit_pause_state_changed(&e, &pool.admin, u32::MAX, paused);
 
         Ok(())
     }
@@ -1019,6 +1030,7 @@ impl EmergencyGuardTrait for LiquidityPool {
             guard.pause_state &= !operation;
         }
         save_guard(env, &guard);
+        emit_pause_state_changed(env, &admin, operation, paused);
 
         Ok(())
     }
@@ -1028,6 +1040,7 @@ impl EmergencyGuardTrait for LiquidityPool {
         let mut guard = load_guard(env);
         guard.pause_state = u32::MAX;
         save_guard(env, &guard);
+        emit_emergency_paused_all(env, &approvers);
         Ok(())
     }
 
@@ -1036,6 +1049,7 @@ impl EmergencyGuardTrait for LiquidityPool {
         let mut guard = load_guard(env);
         guard.pause_state = 0;
         save_guard(env, &guard);
+        emit_resumed_all(env, &approvers);
         Ok(())
     }
 
@@ -1059,6 +1073,8 @@ impl EmergencyGuardTrait for LiquidityPool {
             save_pool(env, &pool);
         }
 
+        emit_guard_initialized(env, &admins, threshold);
+
         Ok(())
     }
 
@@ -1067,8 +1083,9 @@ impl EmergencyGuardTrait for LiquidityPool {
 
         let mut guard = load_guard(env);
         if !guard.admins.iter().any(|a| a == new_admin) {
-            guard.admins.push_back(new_admin);
+            guard.admins.push_back(new_admin.clone());
             save_guard(env, &guard);
+            emit_admin_added(env, &approvers, &new_admin);
         }
 
         Ok(())
@@ -1104,6 +1121,7 @@ impl EmergencyGuardTrait for LiquidityPool {
                 signature_threshold: guard.signature_threshold,
             },
         );
+        emit_admin_removed(env, &approvers, &admin);
 
         if let Ok(mut pool) = load_pool(env) {
             let updated_guard = load_guard(env);

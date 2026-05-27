@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, log, Address, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
 
 /// Granular pause types using bitmask for efficient storage
 /// Each bit represents a different pausable operation
@@ -72,10 +72,46 @@ pub enum GuardError {
     AlreadyInitialized = 6,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardInitializedEvent {
+    pub admins: Vec<Address>,
+    pub threshold: u32,
+}
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PauseStateChangedEvent {
+    pub admin: Address,
+    pub operation: u32,
+    pub paused: bool,
+}
 
-/// Result type for guard operations
-// Result type for guard operations replaced inline
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyPausedEvent {
+    pub approvers: Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumedEvent {
+    pub approvers: Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminAddedEvent {
+    pub approvers: Vec<Address>,
+    pub new_admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRemovedEvent {
+    pub approvers: Vec<Address>,
+    pub admin: Address,
+}
 
 /// EmergencyGuard trait for standardized pause and admin management
 pub trait EmergencyGuardTrait {
@@ -113,6 +149,72 @@ pub trait EmergencyGuardTrait {
     fn is_admin(env: &Env, addr: &Address) -> bool;
 }
 
+const EVENT_INIT_GUARD: &str = "emergency_guard_initialized";
+const EVENT_SET_PAUSE: &str = "emergency_guard_pause_state_changed";
+const EVENT_EMERGENCY_PAUSE_ALL: &str = "emergency_guard_emergency_paused_all";
+const EVENT_RESUME_ALL: &str = "emergency_guard_resumed_all";
+const EVENT_ADD_ADMIN: &str = "emergency_guard_admin_added";
+const EVENT_REMOVE_ADMIN: &str = "emergency_guard_admin_removed";
+
+pub fn emit_guard_initialized(e: &Env, admins: &Vec<Address>, threshold: u32) {
+    e.events().publish(
+        (String::from_str(e, EVENT_INIT_GUARD),),
+        GuardInitializedEvent {
+            admins: admins.clone(),
+            threshold,
+        },
+    );
+}
+
+pub fn emit_pause_state_changed(e: &Env, admin: &Address, operation: u32, paused: bool) {
+    e.events().publish(
+        (String::from_str(e, EVENT_SET_PAUSE), admin.clone()),
+        PauseStateChangedEvent {
+            admin: admin.clone(),
+            operation,
+            paused,
+        },
+    );
+}
+
+pub fn emit_emergency_paused_all(e: &Env, approvers: &Vec<Address>) {
+    e.events().publish(
+        (String::from_str(e, EVENT_EMERGENCY_PAUSE_ALL),),
+        EmergencyPausedEvent {
+            approvers: approvers.clone(),
+        },
+    );
+}
+
+pub fn emit_resumed_all(e: &Env, approvers: &Vec<Address>) {
+    e.events().publish(
+        (String::from_str(e, EVENT_RESUME_ALL),),
+        ResumedEvent {
+            approvers: approvers.clone(),
+        },
+    );
+}
+
+pub fn emit_admin_added(e: &Env, approvers: &Vec<Address>, new_admin: &Address) {
+    e.events().publish(
+        (String::from_str(e, EVENT_ADD_ADMIN), new_admin.clone()),
+        AdminAddedEvent {
+            approvers: approvers.clone(),
+            new_admin: new_admin.clone(),
+        },
+    );
+}
+
+pub fn emit_admin_removed(e: &Env, approvers: &Vec<Address>, admin: &Address) {
+    e.events().publish(
+        (String::from_str(e, EVENT_REMOVE_ADMIN), admin.clone()),
+        AdminRemovedEvent {
+            approvers: approvers.clone(),
+            admin: admin.clone(),
+        },
+    );
+}
+
 #[contract]
 pub struct EmergencyGuard;
 
@@ -142,6 +244,8 @@ impl EmergencyGuard {
             .instance()
             .set(&DataKey::PauseState, &PauseType::new(0));
 
+        emit_guard_initialized(&env, &admins, threshold);
+
         Ok(())
     }
 
@@ -157,7 +261,12 @@ impl EmergencyGuard {
     }
 
     /// Set pause state for a specific operation (any single admin can do this)
-    pub fn set_pause(env: Env, admin: Address, operation: u32, paused: bool) -> Result<(), GuardError> {
+    pub fn set_pause(
+        env: Env,
+        admin: Address,
+        operation: u32,
+        paused: bool,
+    ) -> Result<(), GuardError> {
         admin.require_auth();
 
         // Check if caller is admin
@@ -176,12 +285,7 @@ impl EmergencyGuard {
             .instance()
             .set(&DataKey::PauseState, &pause_state);
 
-        log!(
-            &env,
-            "Pause state updated: op={}, paused={}",
-            operation,
-            paused
-        );
+        emit_pause_state_changed(&env, &admin, operation, paused);
         Ok(())
     }
 
@@ -196,7 +300,7 @@ impl EmergencyGuard {
             .instance()
             .set(&DataKey::PauseState, &pause_state);
 
-        log!(&env, "Emergency pause all activated");
+        emit_emergency_paused_all(&env, &approvers);
         Ok(())
     }
 
@@ -209,26 +313,34 @@ impl EmergencyGuard {
             .instance()
             .set(&DataKey::PauseState, &pause_state);
 
-        log!(&env, "Resume all activated");
+        emit_resumed_all(&env, &approvers);
         Ok(())
     }
 
     /// Add new admin (multi-sig required)
-    pub fn add_admin(env: Env, approvers: Vec<Address>, new_admin: Address) -> Result<(), GuardError> {
+    pub fn add_admin(
+        env: Env,
+        approvers: Vec<Address>,
+        new_admin: Address,
+    ) -> Result<(), GuardError> {
         Self::check_multi_sig(&env, &approvers)?;
 
         let mut admins = Self::get_admins(env.clone());
         if !admins.iter().any(|a| a == new_admin) {
             admins.push_back(new_admin.clone());
             env.storage().instance().set(&DataKey::Admins, &admins);
-            log!(&env, "Admin added: {}", new_admin);
+            emit_admin_added(&env, &approvers, &new_admin);
         }
 
         Ok(())
     }
 
     /// Remove admin (multi-sig required)
-    pub fn remove_admin(env: Env, approvers: Vec<Address>, admin: Address) -> Result<(), GuardError> {
+    pub fn remove_admin(
+        env: Env,
+        approvers: Vec<Address>,
+        admin: Address,
+    ) -> Result<(), GuardError> {
         Self::check_multi_sig(&env, &approvers)?;
 
         let admins = Self::get_admins(env.clone());
@@ -253,7 +365,7 @@ impl EmergencyGuard {
         }
 
         env.storage().instance().set(&DataKey::Admins, &new_admins);
-        log!(&env, "Admin removed: {}", admin);
+        emit_admin_removed(&env, &approvers, &admin);
         Ok(())
     }
 

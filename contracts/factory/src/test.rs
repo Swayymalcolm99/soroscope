@@ -2,7 +2,7 @@
 extern crate std;
 use super::*;
 
-use soroban_sdk::{testutils::Address as _, Env};
+use soroban_sdk::{testutils::Address as _, vec, Address, Env};
 
 // Import the Liquidity Pool WASM for integration testing.
 // This requires running `cargo build --target wasm32-unknown-unknown --release`
@@ -32,6 +32,59 @@ fn test_initialization() {
     // Pair should not exist yet
     let result = factory_client.get_pair(&token_a, &token_b);
     assert_eq!(result, None);
+}
+
+#[test]
+fn test_guard_admin_initialization() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory_id = env.register(LiquidityPoolFactory, ());
+    let factory_client = LiquidityPoolFactoryClient::new(&env, &factory_id);
+
+    let admin1 = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    let admins = vec![&env, admin1.clone(), admin2.clone()];
+
+    assert_eq!(factory_client.initialize(&admins, &2), Ok(()));
+    assert_eq!(factory_client.get_threshold(), 2);
+    assert_eq!(factory_client.get_admins().len(), 2);
+    assert!(factory_client.is_admin(&admin1));
+    assert!(factory_client.is_admin(&admin2));
+}
+
+#[test]
+fn test_guard_admin_threshold_checks() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory_id = env.register(LiquidityPoolFactory, ());
+    let factory_client = LiquidityPoolFactoryClient::new(&env, &factory_id);
+
+    let admin1 = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let admins = vec![&env, admin1.clone(), admin2.clone()];
+
+    assert_eq!(factory_client.initialize(&admins, &2), Ok(()));
+
+    let single_approver = vec![&env, admin1.clone()];
+    assert_eq!(
+        factory_client.add_admin(&single_approver, &new_admin),
+        Err(GuardError::InsufficientSignatures)
+    );
+
+    let full_approvals = vec![&env, admin1.clone(), admin2.clone()];
+    assert_eq!(factory_client.add_admin(&full_approvals, &new_admin), Ok(()));
+    assert!(factory_client.is_admin(&new_admin));
+
+    assert_eq!(
+        factory_client.remove_admin(&single_approver, &new_admin),
+        Err(GuardError::InsufficientSignatures)
+    );
+
+    assert_eq!(factory_client.remove_admin(&full_approvals, &new_admin), Ok(()));
+    assert!(!factory_client.is_admin(&new_admin));
 }
 
 #[test]

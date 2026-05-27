@@ -1,7 +1,8 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, IntoVal,
+    contract, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, IntoVal, Vec,
 };
+use emergency_guard::{EmergencyGuard, GuardError};
 
 /// Storage key for pair registry.
 /// Stored in **instance** storage because the factory is a singleton contract
@@ -18,6 +19,44 @@ pub struct LiquidityPoolFactory;
 
 #[contractimpl]
 impl LiquidityPoolFactory {
+    /// Initializes the factory admin committee using the shared EmergencyGuard storage.
+    pub fn initialize(env: Env, admins: Vec<Address>, threshold: u32) -> Result<(), GuardError> {
+        EmergencyGuard::initialize(env, admins, threshold)
+    }
+
+    /// Add a new admin using the shared multi-signature approval flow.
+    pub fn add_admin(
+        env: Env,
+        approvers: Vec<Address>,
+        new_admin: Address,
+    ) -> Result<(), GuardError> {
+        EmergencyGuard::add_admin(env, approvers, new_admin)
+    }
+
+    /// Remove an admin using the shared multi-signature approval flow.
+    pub fn remove_admin(
+        env: Env,
+        approvers: Vec<Address>,
+        admin: Address,
+    ) -> Result<(), GuardError> {
+        EmergencyGuard::remove_admin(env, approvers, admin)
+    }
+
+    /// Returns the currently configured factory admins.
+    pub fn get_admins(env: Env) -> Vec<Address> {
+        EmergencyGuard::get_admins(env)
+    }
+
+    /// Returns the required multi-signature threshold.
+    pub fn get_threshold(env: Env) -> u32 {
+        EmergencyGuard::get_threshold(env)
+    }
+
+    /// Checks whether an address is currently authorized as a factory admin.
+    pub fn is_admin(env: Env, addr: Address) -> bool {
+        EmergencyGuard::is_admin(&env, &addr)
+    }
+
     /// Deploys a new Liquidity Pool contract for a unique pair of tokens.
     pub fn create_pair(
         env: Env,

@@ -2,7 +2,8 @@ use crate::admin::{has_administrator, read_administrator, write_administrator};
 use crate::allowance::{read_allowance, spend_allowance, write_allowance};
 use crate::balance::{read_balance, receive_balance, spend_balance};
 use crate::metadata::{read_decimal, read_name, read_symbol, write_metadata};
-use soroban_sdk::{contract, contractimpl, Address, Env, String};
+use emergency_guard::{EmergencyGuard, GuardError};
+use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
 
 pub trait TokenTrait {
     fn initialize(e: Env, admin: Address, decimal: u32, name: String, symbol: String);
@@ -18,6 +19,8 @@ pub trait TokenTrait {
     fn decimals(e: Env) -> u32;
     fn name(e: Env) -> String;
     fn symbol(e: Env) -> String;
+    fn guard_pause(e: Env, admin: Address, operation: u32, paused: bool) -> Result<(), GuardError>;
+    fn guard_unpause(e: Env, approvers: Vec<Address>) -> Result<(), GuardError>;
 }
 
 #[contract]

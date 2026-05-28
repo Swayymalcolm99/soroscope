@@ -10,6 +10,7 @@ import { MOCK_CONTRACT_FUNCTIONS, generateMockResult, generateMockResourceCost }
 import type { ContractFunction, InvocationResult } from '../lib/sorobantypes';
 import { UploadZone } from '../components/upload-zone';
 import { extractErrorDetails, createUserFriendlyMessage } from '../lib/errorHandling';
+import { ErrorBoundary } from '../components/ErrorBoundary';
 
 export default function Home() {
   const [contractId, setContractId] = useState('CAEZJVJ4N7P7GRUVD5NG5LYYH23AQHJUKQEUHW54LR5PGQX3V7FXD7Q');
@@ -124,12 +125,30 @@ export default function Home() {
               Drop a compiled Soroban contract (.wasm) to analyse its resource usage
             </p>
           </div>
-          <UploadZone
-            onFileReady={(file) => {
-              console.log('[UploadZone] Contract ready for analysis:', file.name, file.size, 'bytes');
-              // TODO: wire into your analysis flow, e.g. POST file bytes to /analyze
-            }}
-          />
+          <ErrorBoundary
+            fallback={(error, reset) => (
+              <div className="rounded-lg border border-red-800/60 bg-red-950/30 p-6 text-center text-red-100">
+                <p className="text-sm font-semibold">Upload failed unexpectedly</p>
+                <p className="mx-auto mt-2 max-w-md text-xs leading-relaxed text-red-200/80">
+                  {error.message}
+                </p>
+                <button
+                  type="button"
+                  onClick={reset}
+                  className="mt-4 rounded-md border border-red-700/70 px-4 py-2 text-sm text-red-100 hover:bg-red-900/40"
+                >
+                  Try another file
+                </button>
+              </div>
+            )}
+          >
+            <UploadZone
+              onFileReady={(file) => {
+                console.log('[UploadZone] Contract ready for analysis:', file.name, file.size, 'bytes');
+                // TODO: wire into your analysis flow, e.g. POST file bytes to /analyze
+              }}
+            />
+          </ErrorBoundary>
         </div>
 
         {/* Contract ID Input */}

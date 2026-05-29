@@ -143,9 +143,12 @@ export default function Home() {
             )}
           >
             <UploadZone
+              backendUrl="http://localhost:8080/analyze/wasm"
+              enableBackendValidation={true}
               onFileReady={(file) => {
-                console.log('[UploadZone] Contract ready for analysis:', file.name, file.size, 'bytes');
-                // TODO: wire into your analysis flow, e.g. POST file bytes to /analyze
+                console.log('[UploadZone] Contract validated and ready for analysis:', file.name, file.size, 'bytes');
+                // File has been validated by backend and is ready for resource analysis
+                // You can now use this file for further processing or analysis
               }}
             />
           </ErrorBoundary>

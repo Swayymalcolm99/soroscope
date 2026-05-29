@@ -51,11 +51,12 @@ impl LiquidityPoolFactory {
 
         let init_args = soroban_sdk::vec![
             &env,
+            env.current_contract_address().into_val(&env),
             token_0.clone().into_val(&env),
             token_1.clone().into_val(&env)
         ];
 
-        let _res: () = env.invoke_contract(
+        let _res: soroban_sdk::Val = env.invoke_contract(
             &deployed_address,
             &soroban_sdk::Symbol::new(&env, "initialize"),
             init_args,

@@ -1951,7 +1951,6 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 name = "liquidity_pool"
 version = "0.1.0"
 dependencies = [
- "emergency_guard",
  "proptest",
  "soroban-sdk",
 ]
@@ -3631,9 +3630,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "soroban-staking-rewards"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+ "soroscope-error-codes",
+ "soroscope-math",
+]
+
+[[package]]
 name = "soroban-token-contract"
 version = "0.0.0"
 dependencies = [
+ "emergency_guard",
  "soroban-sdk",
 ]
 

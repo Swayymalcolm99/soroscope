@@ -9,9 +9,9 @@
 #[cfg(test)]
 mod tests {
     use crate::simulation::{
-        CallGraph, CallNode, SimulationCache, SimulationEngine,
-        SimulationStateSnapshot, SorobanResources, TtlEntryReport,
-        SimulationResult, ExtendTtlSuggestion, TtlAnalysisReport,
+        CallGraph, CallNode, ExtendTtlSuggestion, SimulationCache, SimulationEngine,
+        SimulationResult, SimulationStateSnapshot, SorobanResources, TtlAnalysisReport,
+        TtlEntryReport,
     };
     use proptest::prelude::*;
     use std::collections::HashMap;
@@ -30,7 +30,13 @@ mod tests {
 
     /// Arbitrary `SorobanResources`.
     fn arb_resources() -> impl Strategy<Value = SorobanResources> {
-        (any::<u64>(), any::<u64>(), any::<u64>(), any::<u64>(), any::<u64>())
+        (
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+        )
             .prop_map(|(cpu, ram, lr, lw, tx)| SorobanResources {
                 cpu_instructions: cpu,
                 ram_bytes: ram,
@@ -42,22 +48,22 @@ mod tests {
 
     /// Arbitrary `TtlEntryReport`.
     fn arb_ttl_report() -> impl Strategy<Value = TtlEntryReport> {
-        ("[a-zA-Z0-9]{1,16}", any::<u32>(), -500_000i64..500_000i64)
-            .prop_map(|(key, live, rem)| TtlEntryReport {
+        ("[a-zA-Z0-9]{1,16}", any::<u32>(), -500_000i64..500_000i64).prop_map(|(key, live, rem)| {
+            TtlEntryReport {
                 key,
                 live_until_ledger: live,
                 remaining_ledgers: rem,
-            })
+            }
+        })
     }
 
     /// Arbitrary `CallNode` tree with bounded depth.
     fn arb_call_node() -> impl Strategy<Value = CallNode> {
-        let leaf = ("[a-zA-Z0-9]{4,8}", "[a-zA-Z]{3,10}")
-            .prop_map(|(cid, func)| CallNode {
-                contract_id: cid,
-                function: func,
-                children: vec![],
-            });
+        let leaf = ("[a-zA-Z0-9]{4,8}", "[a-zA-Z]{3,10}").prop_map(|(cid, func)| CallNode {
+            contract_id: cid,
+            function: func,
+            children: vec![],
+        });
 
         leaf.prop_recursive(3, 15, 4, |inner| {
             (
@@ -75,7 +81,12 @@ mod tests {
 
     /// Arbitrary `SimulationResult`.
     fn arb_simulation_result() -> impl Strategy<Value = SimulationResult> {
-        (arb_resources(), any::<u64>(), any::<u64>(), "[a-zA-Z0-9+/=]{0,64}")
+        (
+            arb_resources(),
+            any::<u64>(),
+            any::<u64>(),
+            "[a-zA-Z0-9+/=]{0,64}",
+        )
             .prop_map(|(res, ledger, cost, td)| SimulationResult {
                 resources: res,
                 transaction_hash: None,

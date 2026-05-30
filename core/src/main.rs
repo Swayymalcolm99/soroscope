@@ -1,8 +1,8 @@
 mod auth;
 mod benchmarks;
+mod cache;
 mod comparison;
 mod errors;
-mod simulation_service;
 pub mod fee_analytics;
 pub mod fee_collector;
 pub mod fee_store;
@@ -11,48 +11,29 @@ mod jobs;
 mod parser;
 mod routing;
 pub mod rpc_provider;
-mod cache;
 mod simulation;
+mod simulation_service;
 mod wasm_branch_analysis;
 mod ws;
 
-use crate::cache::{SimulationCache, ContractCache};
+use crate::cache::{ContractCache, SimulationCache};
+use crate::cache::{DiskCache, DiskCacheConfig};
 use crate::comparison::{CompareMode, RegressionFlag, RegressionReport, ResourceDelta};
 use crate::errors::AppError;
-use axum::{
-    extract::State,
-    routing::{get, post},
-    Json, Router,
-};
-use simulation_service::{AnalysisResult, SimulationMetric, SimulationService};
-use std::env;
-use std::path::PathBuf;
-use std::sync::Arc;
-
-#[tokio::main]
-async fn main() {
-    let db_path =
-        env::var("SOROSCOPE_DB_PATH").unwrap_or_else(|_| "soroscope_metrics.db".to_string());
-    let webhook_url = env::var("SOROSCOPE_ALERT_WEBHOOK_URL").ok();
-    let simulation_service = match SimulationService::new(db_path, webhook_url) {
-        Ok(service) => Arc::new(service),
-        Err(err) => {
-            eprintln!("Failed to initialize simulation service: {}", err);
-            return;
-        }
-    };
-
-    // CLI Argument Handling
 use crate::fee_analytics::{FeeAnalyticsEngine, MarketConditions, ModelBreakdown};
 use crate::fee_collector::{FeeCollector, FeeCollectorConfig};
 use crate::fee_store::FeeStore;
-use crate::cache::{DiskCache, DiskCacheConfig};
 use crate::insights::InsightsEngine;
 use crate::jobs::{
     JobId, JobQueue, JobQueueConfig, JobWorker, SubmitJobRequest, SubmitJobResponse,
 };
 use crate::rpc_provider::{ProviderRegistry, RpcProvider};
 use crate::simulation::{SimulationEngine, SimulationResult};
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Json, Router,
+};
 use axum::{
     extract::{Json, Multipart, Path, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
@@ -64,6 +45,7 @@ use axum::{
 use config::{Config, ConfigError};
 use prometheus::{Encoder, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
+use simulation_service::{AnalysisResult, SimulationMetric, SimulationService};
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
@@ -402,16 +384,28 @@ pub struct AnalyzeRequest {
 #[derive(Serialize, ToSchema)]
 pub struct ResourceReport {
     /// CPU instructions consumed
-    #[schema(example = 1500, description = "CPU instructions consumed by the contract call")]
+    #[schema(
+        example = 1500,
+        description = "CPU instructions consumed by the contract call"
+    )]
     pub cpu_instructions: u64,
     /// RAM bytes consumed
-    #[schema(example = 3000, description = "RAM bytes consumed by the contract call")]
+    #[schema(
+        example = 3000,
+        description = "RAM bytes consumed by the contract call"
+    )]
     pub ram_bytes: u64,
     /// Ledger read bytes
-    #[schema(example = 1024, description = "Ledger read bytes during the contract call")]
+    #[schema(
+        example = 1024,
+        description = "Ledger read bytes during the contract call"
+    )]
     pub ledger_read_bytes: u64,
     /// Ledger write bytes
-    #[schema(example = 512, description = "Ledger write bytes during the contract call")]
+    #[schema(
+        example = 512,
+        description = "Ledger write bytes during the contract call"
+    )]
     pub ledger_write_bytes: u64,
     /// Transaction size in bytes
     #[schema(example = 450, description = "Transaction size in bytes")]
@@ -420,22 +414,16 @@ pub struct ResourceReport {
     #[schema(example = 1000, description = "Estimated cost in stroops")]
     pub cost_stroops: u64,
     /// Report showing which data was injected vs live
-    #[schema(description = "State dependency report for the simulation")]
     pub state_dependency: Option<Vec<StateDependencyReport>>,
     /// TTL status for touched ledger entries and extension suggestions.
-    #[schema(description = "TTL analysis report for touched ledger entries")]
     pub ttl_analysis: Option<TtlAnalysisApiReport>,
     /// Efficiency score (0–100) and optimisation insights.
-    #[schema(description = "Efficiency score and optimisation insights")]
     pub nutrition: NutritionReport,
     /// Cross-contract call graph
-    #[schema(description = "Cross-contract call graph")]
     pub call_graph: Option<crate::simulation::CallGraph>,
     /// Call graph in Mermaid format
-    #[schema(description = "Call graph in Mermaid format")]
     pub call_graph_mermaid: Option<String>,
     /// Snapshot of the ledger state used/touched during simulation
-    #[schema(description = "Snapshot of the ledger state used/touched during simulation")]
     pub state_snapshot: Option<crate::simulation::SimulationStateSnapshot>,
     /// Protocol version used for this simulation
     #[schema(example = 20)]
@@ -889,7 +877,13 @@ async fn analyze_wasm(
 
     let start_time = std::time::Instant::now();
     let resources = tokio::task::spawn_blocking(move || {
-        simulation::profile_contract(wasm_bytes, function_name, args, payload.protocol_version, payload.enable_experimental)
+        simulation::profile_contract(
+            wasm_bytes,
+            function_name,
+            args,
+            payload.protocol_version,
+            payload.enable_experimental,
+        )
     })
     .await
     .map_err(|e| {
@@ -1018,8 +1012,8 @@ async fn analyze_wasm_branches(
     State(_state): State<Arc<AppState>>,
     Json(payload): Json<AnalyzeWasmBranchesRequest>,
 ) -> Result<Json<WasmBranchAnalysisResponse>, AppError> {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
     use crate::wasm_branch_analysis::analyze_wasm_branches as run_analysis;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
     tracing::info!(
         function_name = %payload.function_name,
@@ -1033,12 +1027,10 @@ async fn analyze_wasm_branches(
     let function_name = payload.function_name.clone();
     let args = payload.args.clone().unwrap_or_default();
 
-    let report = tokio::task::spawn_blocking(move || {
-        run_analysis(wasm_bytes, function_name, args)
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("Branch analysis task panicked: {}", e)))?
-    .map_err(|e| AppError::Internal(format!("Branch analysis failed: {}", e)))?;
+    let report = tokio::task::spawn_blocking(move || run_analysis(wasm_bytes, function_name, args))
+        .await
+        .map_err(|e| AppError::Internal(format!("Branch analysis task panicked: {}", e)))?
+        .map_err(|e| AppError::Internal(format!("Branch analysis failed: {}", e)))?;
 
     tracing::info!(
         function_name = %payload.function_name,
@@ -1311,7 +1303,9 @@ async fn analyze_gas_golfing(
     let contract_name = payload.contract_name.clone();
 
     let report = tokio::task::spawn_blocking(move || {
-        state.gas_golfing_analyzer.analyze_wasm(&wasm_bytes, &contract_name)
+        state
+            .gas_golfing_analyzer
+            .analyze_wasm(&wasm_bytes, &contract_name)
     })
     .await
     .map_err(|e| AppError::Internal(format!("Gas golfing analysis task panicked: {}", e)))?;
@@ -1564,10 +1558,12 @@ async fn main() {
         }
 
         if let Some(path) = wasm_path {
-            if let Err(e) = benchmarks::run_token_benchmark(path, simulation_service.as_ref()).await
-            {
-                eprintln!("Benchmark failed: {}", e);
-            if let Err(e) = benchmarks::run_token_benchmark(path) {
+            let db_path = env::var("SOROSCOPE_DB_PATH")
+                .unwrap_or_else(|_| "soroscope_metrics.db".to_string());
+            let webhook_url = env::var("SOROSCOPE_ALERT_WEBHOOK_URL").ok();
+            let simulation_service = SimulationService::new(db_path, webhook_url)
+                .expect("initialize simulation service");
+            if let Err(e) = benchmarks::run_token_benchmark(path, &simulation_service).await {
                 tracing::error!("Benchmark failed: {}", e);
             }
         } else {
@@ -1579,24 +1575,6 @@ async fn main() {
         return;
     }
 
-    // Default Web Server
-    println!("SoroScope CLI Initialized. Run with 'benchmark' argument to profile token contract.");
-
-    // build our application with a single route
-    let app = Router::new()
-        .route(
-            "/",
-            get(|| async {
-                "Hello from SoroScope! Use POST /simulations/analyze to persist + compare simulation metrics."
-            }),
-        )
-        .route("/health", get(|| async { "ok" }))
-        .route(
-            "/error",
-            get(|| async { Err::<&str, AppError>(AppError::BadRequest("Test error".to_string())) }),
-        )
-        .route("/simulations/analyze", post(analyze_simulation))
-        .with_state(simulation_service);
     // ── CLI: compare subcommand ──────────────────────────────────────────
     if args.len() > 1 && args[1] == "compare" {
         if args.len() < 4 {
@@ -1648,7 +1626,9 @@ async fn main() {
     // ── CLI: export subcommand ──────────────────────────────────────────
     if args.len() > 1 && args[1] == "export" {
         if args.len() < 6 {
-            eprintln!("Usage: soroscope-core export <contract_id> <function> <args_json> <output_file>");
+            eprintln!(
+                "Usage: soroscope-core export <contract_id> <function> <args_json> <output_file>"
+            );
             eprintln!("\nSimulate a transaction and export the touched state to a JSON file.");
             std::process::exit(1);
         }
@@ -1664,7 +1644,10 @@ async fn main() {
         let registry = rpc_provider::ProviderRegistry::new(providers);
         let engine = SimulationEngine::with_registry(std::sync::Arc::clone(&registry));
 
-        match engine.simulate_from_contract_id(contract_id, function, parsed_args, None).await {
+        match engine
+            .simulate_from_contract_id(contract_id, function, parsed_args, None, None, None)
+            .await
+        {
             Ok(result) => {
                 if let Some(snapshot) = result.state_snapshot {
                     let json = serde_json::to_string_pretty(&snapshot).unwrap();
@@ -1700,8 +1683,10 @@ async fn main() {
         let function = &args[4];
         let args_json = &args[5];
 
-        let snapshot_json = std::fs::read_to_string(snapshot_file).expect("Failed to read snapshot file");
-        let snapshot: crate::simulation::SimulationStateSnapshot = serde_json::from_str(&snapshot_json).expect("Failed to parse snapshot JSON");
+        let snapshot_json =
+            std::fs::read_to_string(snapshot_file).expect("Failed to read snapshot file");
+        let snapshot: crate::simulation::SimulationStateSnapshot =
+            serde_json::from_str(&snapshot_json).expect("Failed to parse snapshot JSON");
 
         let parsed_args: Vec<String> = serde_json::from_str(args_json).unwrap_or_default();
 
@@ -1709,7 +1694,17 @@ async fn main() {
         let registry = rpc_provider::ProviderRegistry::new(providers);
         let engine = SimulationEngine::with_registry(std::sync::Arc::clone(&registry));
 
-        match engine.simulate_from_contract_id(contract_id, function, parsed_args, Some(snapshot.ledger_entries)).await {
+        match engine
+            .simulate_from_contract_id(
+                contract_id,
+                function,
+                parsed_args,
+                Some(snapshot.ledger_entries),
+                None,
+                None,
+            )
+            .await
+        {
             Ok(result) => {
                 println!("Simulation successful with restored state.");
                 println!("Resources: {:?}", result.resources);
@@ -2096,8 +2091,8 @@ mod tests {
     /// returns i32 (i32.const 42; end). Mirrors the helper in simulation.rs.
     fn minimal_wasm_bytes() -> Vec<u8> {
         use wasm_encoder::{
-            CodeSection, ExportKind, ExportSection, Function, FunctionSection,
-            Module, TypeSection, ValType,
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection, Module, TypeSection,
+            ValType,
         };
         let mut module = Module::new();
         let mut types = TypeSection::new();
@@ -2280,7 +2275,6 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
-
 }
 
 async fn analyze_simulation(

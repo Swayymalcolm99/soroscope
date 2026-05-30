@@ -301,18 +301,6 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "GuardPauseState"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u32": 0
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
                               "symbol": "GuardThreshold"
                             }
                           ]
@@ -331,6 +319,25 @@
                         },
                         "val": {
                           "map": [
+                            {
+                              "key": {
+                                "symbol": "admin"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "base_fee_bps"
+                              },
+                              "val": {
+                                "i128": {
+                                  "hi": 0,
+                                  "lo": 100
+                                }
+                              }
+                            },
                             {
                               "key": {
                                 "symbol": "fee_bps"

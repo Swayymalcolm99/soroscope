@@ -7,7 +7,7 @@ pub struct GasGolfingSuggestion {
     pub pattern_type: String,
     pub description: String,
     pub location: Option<String>, // WASM offset or function name
-    pub severity: String, // "low", "medium", "high"
+    pub severity: String,         // "low", "medium", "high"
     pub gas_saved_estimate: Option<u64>,
     pub suggested_fix: String,
     pub code_example: Option<String>,
@@ -90,8 +90,12 @@ impl GasGolfingAnalyzer {
                 location: None,
                 severity: "high".to_string(),
                 gas_saved_estimate: Some(1000),
-                suggested_fix: "Reuse memory buffers and minimize allocations in hot paths".to_string(),
-                code_example: Some("Use a pre-allocated buffer instead of creating new vectors in loops".to_string()),
+                suggested_fix: "Reuse memory buffers and minimize allocations in hot paths"
+                    .to_string(),
+                code_example: Some(
+                    "Use a pre-allocated buffer instead of creating new vectors in loops"
+                        .to_string(),
+                ),
             });
         }
 
@@ -102,7 +106,10 @@ impl GasGolfingAnalyzer {
         let mut suggestions = Vec::new();
 
         // Look for expensive division operations
-        let div_count = wasm_bytes.iter().filter(|&&b| b == 0x6D || b == 0x6E).count();
+        let div_count = wasm_bytes
+            .iter()
+            .filter(|&&b| b == 0x6D || b == 0x6E)
+            .count();
         if div_count > 5 {
             suggestions.push(GasGolfingSuggestion {
                 pattern_type: "arithmetic_optimization".to_string(),
@@ -110,7 +117,9 @@ impl GasGolfingAnalyzer {
                 location: None,
                 severity: "medium".to_string(),
                 gas_saved_estimate: Some(200),
-                suggested_fix: "Replace divisions with multiplications by reciprocals or use bitwise shifts".to_string(),
+                suggested_fix:
+                    "Replace divisions with multiplications by reciprocals or use bitwise shifts"
+                        .to_string(),
                 code_example: Some("Replace: x / 2\nWith: x >> 1".to_string()),
             });
         }
@@ -123,7 +132,8 @@ impl GasGolfingAnalyzer {
                 location: None,
                 severity: "low".to_string(),
                 gas_saved_estimate: Some(50),
-                suggested_fix: "Use bitwise shifts for multiplication/division by powers of 2".to_string(),
+                suggested_fix: "Use bitwise shifts for multiplication/division by powers of 2"
+                    .to_string(),
                 code_example: Some("Replace: x * 8\nWith: x << 3".to_string()),
             });
         }
@@ -135,7 +145,10 @@ impl GasGolfingAnalyzer {
         let mut suggestions = Vec::new();
 
         // Look for repeated storage operations that could be batched
-        let storage_ops = wasm_bytes.iter().filter(|&&b| b == 0xFC || b == 0xFD).count();
+        let storage_ops = wasm_bytes
+            .iter()
+            .filter(|&&b| b == 0xFC || b == 0xFD)
+            .count();
         if storage_ops > 15 {
             suggestions.push(GasGolfingSuggestion {
                 pattern_type: "storage_batching".to_string(),
@@ -143,8 +156,11 @@ impl GasGolfingAnalyzer {
                 location: None,
                 severity: "high".to_string(),
                 gas_saved_estimate: Some(2000),
-                suggested_fix: "Batch storage operations and minimize redundant reads/writes".to_string(),
-                code_example: Some("Use a single storage update instead of multiple separate calls".to_string()),
+                suggested_fix: "Batch storage operations and minimize redundant reads/writes"
+                    .to_string(),
+                code_example: Some(
+                    "Use a single storage update instead of multiple separate calls".to_string(),
+                ),
             });
         }
 
@@ -155,7 +171,10 @@ impl GasGolfingAnalyzer {
         let mut suggestions = Vec::new();
 
         // Look for deeply nested conditionals
-        let branch_count = wasm_bytes.iter().filter(|&&b| b == 0x04 || b == 0x05).count();
+        let branch_count = wasm_bytes
+            .iter()
+            .filter(|&&b| b == 0x04 || b == 0x05)
+            .count();
         if branch_count > 20 {
             suggestions.push(GasGolfingSuggestion {
                 pattern_type: "branch_optimization".to_string(),
@@ -163,8 +182,12 @@ impl GasGolfingAnalyzer {
                 location: None,
                 severity: "medium".to_string(),
                 gas_saved_estimate: Some(300),
-                suggested_fix: "Simplify conditional logic and consider lookup tables for complex decisions".to_string(),
-                code_example: Some("Replace nested if-else with a lookup table or early returns".to_string()),
+                suggested_fix:
+                    "Simplify conditional logic and consider lookup tables for complex decisions"
+                        .to_string(),
+                code_example: Some(
+                    "Replace nested if-else with a lookup table or early returns".to_string(),
+                ),
             });
         }
 

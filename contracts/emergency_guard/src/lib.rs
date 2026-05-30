@@ -74,9 +74,6 @@ pub enum GuardError {
     AlreadyInitialized = 6,
 }
 
-/// Result type for guard operations
-// Result type for guard operations replaced inline
-
 /// EmergencyGuard trait for standardized pause and admin management
 pub trait EmergencyGuardTrait {
     /// Check if an operation is paused. Returns Err if paused.
@@ -125,7 +122,7 @@ impl EmergencyGuard {
         }
 
         // Verify threshold is valid
-        if threshold == 0 || threshold > admins.len() as u32 {
+        if threshold == 0 || threshold > admins.len() {
             return Err(GuardError::InvalidThreshold);
         }
 
@@ -264,7 +261,7 @@ impl EmergencyGuard {
         let admins = Self::get_admins(env.clone());
         let threshold = Self::get_threshold(env.clone());
 
-        if admins.len() as u32 <= threshold {
+        if admins.len() <= threshold {
             return Err(GuardError::InvalidThreshold);
         }
 

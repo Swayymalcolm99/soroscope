@@ -2,8 +2,9 @@
 
 use crate::insights::InsightsEngine;
 use crate::simulation::{SimulationEngine, SimulationResult, SorobanResources};
-use crate::ws::{SimulationBus};
+use crate::ws::SimulationBus;
 use chrono::{DateTime, Utc};
+use redis::{AsyncCommands, Client as RedisClient};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,7 +18,6 @@ use tokio::time::interval;
 use tracing;
 use utoipa::ToSchema;
 use uuid::Uuid;
-use redis::{AsyncCommands, Client as RedisClient};
 
 /// Database pool type - supports both PostgreSQL and SQLite
 #[derive(Clone)]
@@ -287,7 +287,11 @@ impl JobQueue {
         // Run migrations
         Self::run_migrations(&pool).await?;
 
-        Ok(Self { pool, redis, config })
+        Ok(Self {
+            pool,
+            redis,
+            config,
+        })
     }
 
     async fn run_migrations(pool: &DbPool) -> Result<(), JobError> {
@@ -366,9 +370,13 @@ impl JobQueue {
         }
 
         // Push JobId to Redis queue
-        let mut conn = self.redis.get_multiplexed_async_connection().await.map_err(|e| {
-            JobError::ProcessingFailed(format!("Failed to get Redis connection: {}", e))
-        })?;
+        let mut conn = self
+            .redis
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| {
+                JobError::ProcessingFailed(format!("Failed to get Redis connection: {}", e))
+            })?;
 
         conn.lpush::<_, _, ()>("soroscope:jobs:queue", id.0.to_string())
             .await
@@ -639,9 +647,13 @@ impl JobQueue {
         // Push back to Redis queue after delay (using a simple sleep for now or a delayed set)
         // For a robust implementation, we'd use a sorted set for delayed jobs.
         // For now, let's just push it back to the queue.
-        let mut conn = self.redis.get_multiplexed_async_connection().await.map_err(|e| {
-            JobError::ProcessingFailed(format!("Failed to get Redis connection: {}", e))
-        })?;
+        let mut conn = self
+            .redis
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| {
+                JobError::ProcessingFailed(format!("Failed to get Redis connection: {}", e))
+            })?;
 
         let queue = self.clone();
         let id_str = job.id.0.to_string();
@@ -813,15 +825,11 @@ pub async fn cancel_job_handler(
     Path(id): Path<String>,
 ) -> Result<Json<Job>, AppError> {
     let job_id = JobId::from_str(&id).map_err(|_| AppError::BadRequest("Invalid job ID".into()))?;
-    let job = state
-        .job_queue
-        .cancel(&job_id)
-        .await
-        .map_err(|e| match e {
-            JobError::NotFound(_) => AppError::NotFound(format!("Job {} not found", id)),
-            JobError::CannotCancel(_) => AppError::BadRequest(e.to_string()),
-            _ => AppError::Internal(e.to_string()),
-        })?;
+    let job = state.job_queue.cancel(&job_id).await.map_err(|e| match e {
+        JobError::NotFound(_) => AppError::NotFound(format!("Job {} not found", id)),
+        JobError::CannotCancel(_) => AppError::BadRequest(e.to_string()),
+        _ => AppError::Internal(e.to_string()),
+    })?;
 
     Ok(Json(job))
 }
@@ -928,19 +936,36 @@ impl JobWorker {
 
                     tokio::spawn(async move {
                         let _permit = permit;
-                        
-                        let result = Self::process_job(&queue, job_id, engine, insights, config, http_client).await;
-                        
+
+                        let result = Self::process_job(
+                            &queue,
+                            job_id,
+                            engine,
+                            insights,
+                            config,
+                            http_client,
+                        )
+                        .await;
+
                         // Clean up processing list after completion
                         let mut conn = match queue.redis.get_multiplexed_async_connection().await {
                             Ok(c) => c,
                             Err(_) => return,
                         };
-                        let _: Result<(), _> = conn.lrem("soroscope:jobs:processing", 1, id_str_clone).await;
+                        let _: Result<(), _> = conn
+                            .lrem("soroscope:jobs:processing", 1, id_str_clone)
+                            .await;
 
-                        if let Err(e) =
-                            Self::process_job(&queue, job, engine, insights, config, http_client, bus)
-                                .await
+                        if let Err(e) = Self::process_job(
+                            &queue,
+                            job,
+                            engine,
+                            insights,
+                            config,
+                            http_client,
+                            bus,
+                        )
+                        .await
                         {
                             tracing::error!("Job processing error: {}", e);
                         }
@@ -964,7 +989,10 @@ impl JobWorker {
         http_client: Client,
         bus: Option<Arc<SimulationBus>>,
     ) -> Result<(), JobError> {
-        let job = queue.get(&job_id).await?.ok_or(JobError::NotFound(job_id))?;
+        let job = queue
+            .get(&job_id)
+            .await?
+            .ok_or(JobError::NotFound(job_id))?;
         tracing::info!(job_id = %job.id, "Processing job");
 
         // Mark as processing and emit first progress event
@@ -988,7 +1016,11 @@ impl JobWorker {
 
                 // Emit completed event with resource summary
                 if let Some(b) = &bus {
-                    if let JobResult::Success { simulation_result: Some(ref sim), .. } = job_result {
+                    if let JobResult::Success {
+                        simulation_result: Some(ref sim),
+                        ..
+                    } = job_result
+                    {
                         b.publish(SimulationBus::completed(
                             &job.id,
                             &sim.resources,
@@ -1016,12 +1048,16 @@ impl JobWorker {
             Ok(Err(e)) => {
                 let error_msg = e.to_string();
                 queue.fail(&job.id, &error_msg, "ProcessingError").await?;
-                
+
                 // Attempt retry
                 let _ = queue.retry_job(&job).await;
 
                 if let Some(b) = &bus {
-                    b.publish(SimulationBus::failed(&job.id, &error_msg, "ProcessingError"));
+                    b.publish(SimulationBus::failed(
+                        &job.id,
+                        &error_msg,
+                        "ProcessingError",
+                    ));
                 }
 
                 if let Some(webhook_config) = job.get_webhook_config() {
@@ -1040,7 +1076,7 @@ impl JobWorker {
             Err(_) => {
                 let error_msg = format!("Job timed out after {} seconds", job.timeout_secs);
                 queue.fail(&job.id, &error_msg, "Timeout").await?;
-                
+
                 // Attempt retry
                 let _ = queue.retry_job(&job).await;
 
@@ -1100,6 +1136,8 @@ impl JobWorker {
                         &function_name,
                         args.unwrap_or_default(),
                         ledger_overrides,
+                        None,
+                        None,
                     )
                     .await
                     .map_err(|e| {
@@ -1127,7 +1165,7 @@ impl JobWorker {
                 if let Some(ref b) = bus {
                     b.publish(SimulationBus::consensus_check(
                         &job.id,
-                        true, // reached this point → consensus passed (or failover mode)
+                        true,   // reached this point → consensus passed (or failover mode)
                         vec![], // provider names are opaque at this layer
                         None,
                     ));

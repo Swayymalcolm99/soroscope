@@ -1,29 +1,24 @@
 use crate::parser::ArgParser;
 use crate::rpc_provider::ProviderRegistry;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-<<<<<<< Updated upstream
-// use moka::future::Cache;
-=======
 use ed25519_dalek::Signer as Ed25519Signer;
-use moka::future::Cache;
->>>>>>> Stashed changes
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use soroban_sdk::xdr::{
     AccountId, Hash, HashIdPreimage, HashIdPreimageSorobanAuthorization, HostFunction,
-    InvokeContractArgs, InvokeHostFunctionOp, LedgerEntry, LedgerKey, Limits, Memo, MuxedAccount,
-    Operation, OperationBody, Preconditions, ReadXdr, ScAddress, ScMapEntry, ScSymbol, ScVal,
-    SequenceNumber, SorobanAddressCredentials, SorobanAuthorizationEntry,
+    InvokeContractArgs, InvokeHostFunctionOp, LedgerEntry, LedgerKey, LedgerKeyContractCode,
+    LedgerKeyContractData, Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+    PublicKey, ReadXdr, ScAddress, ScMapEntry, ScSymbol, ScVal, SequenceNumber,
+    SorobanAddressCredentials, SorobanAuthorizationEntry,
     SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials,
     SorobanTransactionData, Transaction, TransactionExt, TransactionV1Envelope, Uint256, VecM,
-    WriteXdr,
+    WriteXdr, DiagnosticEvent,
 };
 use std::collections::HashMap;
 // use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use stellar_strkey::Strkey;
+use stellar_strkey::{Contract as StrkeyContract, Strkey};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
@@ -72,6 +67,12 @@ pub enum SimulationError {
     /// panic, budget exhaustion, malformed WASM).
     #[error("Contract execution failed: {0}")]
     ExecutionFailed(String),
+
+    #[error("Insufficient consensus providers: {0}")]
+    InsufficientConsensusProviders(String),
+
+    #[error("Consensus mismatch: {0}")]
+    ConsensusMismatch(String),
 }
 
 impl SimulationError {
@@ -103,19 +104,14 @@ impl From<soroban_env_host::HostError> for SimulationError {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Default)]
 pub struct SorobanResources {
     /// CPU instructions consumed by the contract call
-    #[schema(description = "CPU instructions consumed by the contract call")]
     pub cpu_instructions: u64,
     /// RAM bytes consumed by the contract call
-    #[schema(description = "RAM bytes consumed by the contract call")]
     pub ram_bytes: u64,
     /// Ledger read bytes during the contract call
-    #[schema(description = "Ledger read bytes during the contract call")]
     pub ledger_read_bytes: u64,
     /// Ledger write bytes during the contract call
-    #[schema(description = "Ledger write bytes during the contract call")]
     pub ledger_write_bytes: u64,
     /// Transaction size in bytes
-    #[schema(description = "Transaction size in bytes")]
     pub transaction_size_bytes: u64,
 }
 
@@ -166,12 +162,11 @@ impl WasmInstrumenter {
         let mut export_names: HashMap<u32, String> = HashMap::new();
 
         for payload in Parser::new(0).parse_all(wasm_bytes) {
-            let payload = payload.map_err(|e| {
-                SimulationError::InvalidContract(format!("WASM parse error: {e}"))
-            })?;
+            let payload = payload
+                .map_err(|e| SimulationError::InvalidContract(format!("WASM parse error: {e}")))?;
             match payload {
                 Payload::ImportSection(reader) => {
-                    for import in reader.into_imports() {
+                    for import in reader.into_iter() {
                         let import = import.map_err(|e| {
                             SimulationError::InvalidContract(format!(
                                 "WASM import parse error: {e}"
@@ -193,8 +188,7 @@ impl WasmInstrumenter {
                             ))
                         })?;
                         if export.kind == ExternalKind::Func {
-                            export_names
-                                .insert(export.index, export.name.to_string());
+                            export_names.insert(export.index, export.name.to_string());
                         }
                     }
                 }
@@ -219,7 +213,11 @@ impl WasmInstrumenter {
             .map(|(idx, name)| (name, idx))
             .collect();
 
-        Ok(WasmInstrumenter { func_names, export_map, import_func_count })
+        Ok(WasmInstrumenter {
+            func_names,
+            export_map,
+            import_func_count,
+        })
     }
 
     /// Return the function name map (defined-function index → name).
@@ -252,11 +250,11 @@ impl WasmInstrumenter {
     ///
     /// Returns the re-encoded WASM bytes.
     pub fn instrument(&self, wasm_bytes: &[u8]) -> Result<Vec<u8>, SimulationError> {
+        use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
         use wasm_encoder::{
             CodeSection, ConstExpr, ExportKind, ExportSection, Function, FunctionSection,
             GlobalSection, GlobalType, Instruction, Module, TypeSection, ValType,
         };
-        use wasm_encoder::reencode::{RoundtripReencoder, Reencode};
         use wasmparser::{Parser, Payload};
 
         let n = self.func_names.len() as u32;
@@ -271,9 +269,8 @@ impl WasmInstrumenter {
         let mut type_returns: Vec<usize> = Vec::new();
 
         for payload in Parser::new(0).parse_all(wasm_bytes) {
-            let payload = payload.map_err(|e| {
-                SimulationError::InvalidContract(format!("WASM parse error: {e}"))
-            })?;
+            let payload = payload
+                .map_err(|e| SimulationError::InvalidContract(format!("WASM parse error: {e}")))?;
             match payload {
                 Payload::TypeSection(reader) => {
                     existing_type_count = reader.count();
@@ -286,7 +283,7 @@ impl WasmInstrumenter {
                     }
                 }
                 Payload::ImportSection(reader) => {
-                    for import in reader.into_imports() {
+                    for import in reader.into_iter() {
                         let import = import.map_err(|e| {
                             SimulationError::InvalidContract(format!(
                                 "WASM import parse error: {e}"
@@ -346,12 +343,14 @@ impl WasmInstrumenter {
         };
 
         for payload in Parser::new(0).parse_all(wasm_bytes) {
-            let payload = payload.map_err(|e| {
-                SimulationError::InvalidContract(format!("WASM parse error: {e}"))
-            })?;
+            let payload = payload
+                .map_err(|e| SimulationError::InvalidContract(format!("WASM parse error: {e}")))?;
 
             match payload {
-                Payload::Version { encoding: wasmparser::Encoding::Module, .. } => {}
+                Payload::Version {
+                    encoding: wasmparser::Encoding::Module,
+                    ..
+                } => {}
                 Payload::Version { .. } => {
                     return Err(SimulationError::InvalidContract(
                         "Not a core WASM module".to_string(),
@@ -361,9 +360,11 @@ impl WasmInstrumenter {
                 Payload::TypeSection(reader) => {
                     saw_type_section = true;
                     let mut types = TypeSection::new();
-                    reencoder.parse_type_section(&mut types, reader).map_err(|e| {
-                        SimulationError::InvalidContract(format!("Type section error: {e}"))
-                    })?;
+                    reencoder
+                        .parse_type_section(&mut types, reader)
+                        .map_err(|e| {
+                            SimulationError::InvalidContract(format!("Type section error: {e}"))
+                        })?;
                     // Append the accessor function type: () -> i64
                     types.ty().function([], [ValType::I64]);
                     module.section(&types);
@@ -371,18 +372,22 @@ impl WasmInstrumenter {
 
                 Payload::ImportSection(reader) => {
                     let mut imports = wasm_encoder::ImportSection::new();
-                    reencoder.parse_import_section(&mut imports, reader).map_err(|e| {
-                        SimulationError::InvalidContract(format!("Import section error: {e}"))
-                    })?;
+                    reencoder
+                        .parse_import_section(&mut imports, reader)
+                        .map_err(|e| {
+                            SimulationError::InvalidContract(format!("Import section error: {e}"))
+                        })?;
                     module.section(&imports);
                 }
 
                 Payload::FunctionSection(reader) => {
                     total_func_count = import_func_count + reader.count();
                     let mut functions = FunctionSection::new();
-                    reencoder.parse_function_section(&mut functions, reader).map_err(|e| {
-                        SimulationError::InvalidContract(format!("Function section error: {e}"))
-                    })?;
+                    reencoder
+                        .parse_function_section(&mut functions, reader)
+                        .map_err(|e| {
+                            SimulationError::InvalidContract(format!("Function section error: {e}"))
+                        })?;
                     // Append N wrapper functions, each using the wrapper type () -> i64
                     for _ in 0..n {
                         functions.function(wrapper_type_idx);
@@ -392,38 +397,50 @@ impl WasmInstrumenter {
 
                 Payload::TableSection(reader) => {
                     let mut tables = wasm_encoder::TableSection::new();
-                    reencoder.parse_table_section(&mut tables, reader).map_err(|e| {
-                        SimulationError::InvalidContract(format!("Table section error: {e}"))
-                    })?;
+                    reencoder
+                        .parse_table_section(&mut tables, reader)
+                        .map_err(|e| {
+                            SimulationError::InvalidContract(format!("Table section error: {e}"))
+                        })?;
                     module.section(&tables);
                 }
 
                 Payload::MemorySection(reader) => {
                     let mut memories = wasm_encoder::MemorySection::new();
-                    reencoder.parse_memory_section(&mut memories, reader).map_err(|e| {
-                        SimulationError::InvalidContract(format!("Memory section error: {e}"))
-                    })?;
+                    reencoder
+                        .parse_memory_section(&mut memories, reader)
+                        .map_err(|e| {
+                            SimulationError::InvalidContract(format!("Memory section error: {e}"))
+                        })?;
                     module.section(&memories);
                 }
 
                 Payload::TagSection(reader) => {
                     let mut tags = wasm_encoder::TagSection::new();
-                    reencoder.parse_tag_section(&mut tags, reader).map_err(|e| {
-                        SimulationError::InvalidContract(format!("Tag section error: {e}"))
-                    })?;
+                    reencoder
+                        .parse_tag_section(&mut tags, reader)
+                        .map_err(|e| {
+                            SimulationError::InvalidContract(format!("Tag section error: {e}"))
+                        })?;
                     module.section(&tags);
                 }
 
                 Payload::GlobalSection(reader) => {
                     saw_global_section = true;
                     let mut globals = GlobalSection::new();
-                    reencoder.parse_global_section(&mut globals, reader).map_err(|e| {
-                        SimulationError::InvalidContract(format!("Global section error: {e}"))
-                    })?;
+                    reencoder
+                        .parse_global_section(&mut globals, reader)
+                        .map_err(|e| {
+                            SimulationError::InvalidContract(format!("Global section error: {e}"))
+                        })?;
                     // Append N counter globals (mutable i64, init 0)
                     for _ in 0..n {
                         globals.global(
-                            GlobalType { val_type: ValType::I64, mutable: true, shared: false },
+                            GlobalType {
+                                val_type: ValType::I64,
+                                mutable: true,
+                                shared: false,
+                            },
                             &ConstExpr::i64_const(0),
                         );
                     }
@@ -441,7 +458,11 @@ impl WasmInstrumenter {
                         let mut globals = GlobalSection::new();
                         for _ in 0..n {
                             globals.global(
-                                GlobalType { val_type: ValType::I64, mutable: true, shared: false },
+                                GlobalType {
+                                    val_type: ValType::I64,
+                                    mutable: true,
+                                    shared: false,
+                                },
                                 &ConstExpr::i64_const(0),
                             );
                         }
@@ -449,9 +470,11 @@ impl WasmInstrumenter {
                     }
 
                     let mut exports = ExportSection::new();
-                    reencoder.parse_export_section(&mut exports, reader).map_err(|e| {
-                        SimulationError::InvalidContract(format!("Export section error: {e}"))
-                    })?;
+                    reencoder
+                        .parse_export_section(&mut exports, reader)
+                        .map_err(|e| {
+                            SimulationError::InvalidContract(format!("Export section error: {e}"))
+                        })?;
                     // Append N accessor function exports
                     for i in 0..n {
                         let name = format!("soroscope_count_{i}");
@@ -470,9 +493,11 @@ impl WasmInstrumenter {
 
                 Payload::ElementSection(reader) => {
                     let mut elements = wasm_encoder::ElementSection::new();
-                    reencoder.parse_element_section(&mut elements, reader).map_err(|e| {
-                        SimulationError::InvalidContract(format!("Element section error: {e}"))
-                    })?;
+                    reencoder
+                        .parse_element_section(&mut elements, reader)
+                        .map_err(|e| {
+                            SimulationError::InvalidContract(format!("Element section error: {e}"))
+                        })?;
                     module.section(&elements);
                 }
 
@@ -485,9 +510,11 @@ impl WasmInstrumenter {
 
                 Payload::DataSection(reader) => {
                     let mut data = wasm_encoder::DataSection::new();
-                    reencoder.parse_data_section(&mut data, reader).map_err(|e| {
-                        SimulationError::InvalidContract(format!("Data section error: {e}"))
-                    })?;
+                    reencoder
+                        .parse_data_section(&mut data, reader)
+                        .map_err(|e| {
+                            SimulationError::InvalidContract(format!("Data section error: {e}"))
+                        })?;
                     module.section(&data);
                 }
 
@@ -501,7 +528,11 @@ impl WasmInstrumenter {
                         let mut globals = GlobalSection::new();
                         for _ in 0..n {
                             globals.global(
-                                GlobalType { val_type: ValType::I64, mutable: true, shared: false },
+                                GlobalType {
+                                    val_type: ValType::I64,
+                                    mutable: true,
+                                    shared: false,
+                                },
                                 &ConstExpr::i64_const(0),
                             );
                         }
@@ -561,9 +592,7 @@ impl WasmInstrumenter {
 
                         // Re-encode original instructions
                         let mut ops = func_body.get_operators_reader().map_err(|e| {
-                            SimulationError::InvalidContract(format!(
-                                "Operators reader error: {e}"
-                            ))
+                            SimulationError::InvalidContract(format!("Operators reader error: {e}"))
                         })?;
                         while !ops.eof() {
                             let instr = reencoder.parse_instruction(&mut ops).map_err(|e| {
@@ -613,9 +642,11 @@ impl WasmInstrumenter {
                 }
 
                 Payload::CustomSection(reader) => {
-                    reencoder.parse_custom_section(&mut module, reader).map_err(|e| {
-                        SimulationError::InvalidContract(format!("Custom section error: {e}"))
-                    })?;
+                    reencoder
+                        .parse_custom_section(&mut module, reader)
+                        .map_err(|e| {
+                            SimulationError::InvalidContract(format!("Custom section error: {e}"))
+                        })?;
                 }
 
                 Payload::End(_) => {
@@ -712,13 +743,10 @@ impl FlamegraphBuilder {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OptimizationBuffer {
     /// The original RPC estimation
-    #[schema(description = "The original RPC estimation")]
     pub estimated: u64,
     /// The absolute minimum found
-    #[schema(description = "The absolute minimum found")]
     pub absolute_minimum: u64,
     /// The percentage buffer between estimate and minimum
-    #[schema(description = "The percentage buffer between estimate and minimum")]
     pub buffer_percentage: f64,
 }
 
@@ -826,8 +854,11 @@ impl CallGraph {
 
     fn append_mermaid_nodes(&self, node: &CallNode, mermaid: &mut String, id_gen: &mut usize) {
         let current_id = *id_gen;
-        mermaid.push_str(&format!("    n{current_id}[\"{}:{}\"]\n", node.contract_id, node.function));
-        
+        mermaid.push_str(&format!(
+            "    n{current_id}[\"{}:{}\"]\n",
+            node.contract_id, node.function
+        ));
+
         for child in &node.children {
             *id_gen += 1;
             let child_id = *id_gen;
@@ -991,7 +1022,7 @@ struct GetLedgerEntriesResult {
     entries: Vec<LedgerEntryWithMeta>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LedgerEntryWithMeta {
     key: String,
@@ -1009,6 +1040,26 @@ pub struct SimulationEngine {
     /// When set, the engine will iterate healthy providers and failover automatically.
     registry: Option<Arc<ProviderRegistry>>,
     contract_cache: Option<Arc<crate::cache::ContractCache>>,
+    mode: SimulationMode,
+    local_runner: Option<Arc<crate::runner::LocalRunner>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimulationMode {
+    Failover,
+    Consensus,
+}
+
+impl SimulationMode {
+    pub fn from_config(value: &str) -> Result<Self, SimulationError> {
+        match value.to_ascii_lowercase().as_str() {
+            "failover" => Ok(Self::Failover),
+            "consensus" => Ok(Self::Consensus),
+            other => Err(SimulationError::InvalidContract(format!(
+                "Unknown simulation mode: {other}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1031,6 +1082,8 @@ impl SimulationEngine {
             request_timeout: std::time::Duration::from_secs(30),
             registry: None,
             contract_cache: None,
+            mode: SimulationMode::Failover,
+            local_runner: None,
         }
     }
 
@@ -1047,6 +1100,8 @@ impl SimulationEngine {
             request_timeout: std::time::Duration::from_secs(30),
             registry: Some(registry),
             contract_cache: None,
+            mode,
+            local_runner: None,
         }
     }
 
@@ -1061,6 +1116,8 @@ impl SimulationEngine {
             request_timeout: std::time::Duration::from_secs(30),
             registry: Some(registry),
             contract_cache: Some(cache),
+            mode: SimulationMode::Failover,
+            local_runner: None,
         }
     }
 
@@ -1084,6 +1141,8 @@ impl SimulationEngine {
             request_timeout: timeout,
             registry: Some(registry),
             contract_cache: None,
+            mode,
+            local_runner: None,
         }
     }
 
@@ -1126,20 +1185,31 @@ impl SimulationEngine {
         }
 
         tracing::info!(contract_id = %contract_id, "WASM cache MISS, fetching from RPC");
-        
+
         // 1. Fetch contract instance to get the WASM hash
-        let instance_key = LedgerKey::ContractData(soroban_sdk::xdr::ContractDataLedgerKey {
+        let instance_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: ScAddress::Contract(Hash(contract_hash_bytes)),
             key: ScVal::LedgerKeyContractInstance,
             durability: soroban_sdk::xdr::ContractDataDurability::Persistent,
         });
 
-        let key_xdr = BASE64.encode(instance_key.to_xdr(Limits::none()).map_err(|e| SimulationError::XdrError(e.to_string()))?);
-        
+        let key_xdr = BASE64.encode(
+            instance_key
+                .to_xdr(Limits::none())
+                .map_err(|e| SimulationError::XdrError(e.to_string()))?,
+        );
+
         // We need a provider URL to fetch from.
         let (url, auth_h, auth_v) = match &self.registry {
             Some(reg) => {
-                let p = reg.healthy_providers().await.into_iter().next().ok_or_else(|| SimulationError::RpcRequestFailed("No healthy providers".to_string()))?;
+                let p = reg
+                    .healthy_providers()
+                    .await
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        SimulationError::RpcRequestFailed("No healthy providers".to_string())
+                    })?;
                 (p.url.clone(), p.auth_header.clone(), p.auth_value.clone())
             }
             None => (self.rpc_url.clone(), None, None),
@@ -1154,37 +1224,64 @@ impl SimulationEngine {
             },
         };
 
-        let response: GetLedgerEntriesResponse = self.client.post(&url).json(&req).send().await?.json().await.map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
+        let response: GetLedgerEntriesResponse = self
+            .client
+            .post(&url)
+            .json(&req)
+            .send()
+            .await?
+            .json()
+            .await
+            .map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
         let entries = match response.result {
             LedgerEntriesResponseResult::Success { result } => result.entries,
-            LedgerEntriesResponseResult::Error { error } => return Err(SimulationError::NodeError(error.message)),
+            LedgerEntriesResponseResult::Error { error } => {
+                return Err(SimulationError::NodeError(error.message))
+            }
         };
 
-        let entry_meta = entries.first().ok_or_else(|| SimulationError::InvalidContract("Contract instance not found".to_string()))?;
-        let entry_xdr = entry_meta.xdr.as_ref().ok_or_else(|| SimulationError::InvalidContract("No XDR in ledger entry".to_string()))?;
+        let entry_meta = entries.first().ok_or_else(|| {
+            SimulationError::InvalidContract("Contract instance not found".to_string())
+        })?;
+        let entry_xdr = entry_meta.xdr.as_ref().ok_or_else(|| {
+            SimulationError::InvalidContract("No XDR in ledger entry".to_string())
+        })?;
         let entry_bytes = BASE64.decode(entry_xdr)?;
-        let entry = LedgerEntry::from_xdr(&entry_bytes, Limits::none()).map_err(|e| SimulationError::XdrError(e.to_string()))?;
+        let entry = LedgerEntry::from_xdr(&entry_bytes, Limits::none())
+            .map_err(|e| SimulationError::XdrError(e.to_string()))?;
 
         let wasm_hash = match entry.data {
-            soroban_sdk::xdr::LedgerEntryData::ContractData(d) => {
-                match d.val {
-                    ScVal::ContractInstance(i) => {
-                        match i.executable {
-                            soroban_sdk::xdr::ContractExecutable::Wasm(h) => h,
-                            _ => return Err(SimulationError::InvalidContract("Contract is not a WASM contract".to_string())),
-                        }
+            soroban_sdk::xdr::LedgerEntryData::ContractData(d) => match d.val {
+                ScVal::ContractInstance(i) => match i.executable {
+                    soroban_sdk::xdr::ContractExecutable::Wasm(h) => h,
+                    _ => {
+                        return Err(SimulationError::InvalidContract(
+                            "Contract is not a WASM contract".to_string(),
+                        ))
                     }
-                    _ => return Err(SimulationError::InvalidContract("Invalid contract instance data".to_string())),
+                },
+                _ => {
+                    return Err(SimulationError::InvalidContract(
+                        "Invalid contract instance data".to_string(),
+                    ))
                 }
+            },
+            _ => {
+                return Err(SimulationError::InvalidContract(
+                    "Invalid ledger entry data type".to_string(),
+                ))
             }
-            _ => return Err(SimulationError::InvalidContract("Invalid ledger entry data type".to_string())),
         };
 
         // 2. Fetch the actual WASM bytes
-        let wasm_key = LedgerKey::ContractCode(soroban_sdk::xdr::ContractCodeLedgerKey {
+        let wasm_key = LedgerKey::ContractCode(LedgerKeyContractCode {
             hash: wasm_hash.clone(),
         });
-        let wasm_key_xdr = BASE64.encode(wasm_key.to_xdr(Limits::none()).map_err(|e| SimulationError::XdrError(e.to_string()))?);
+        let wasm_key_xdr = BASE64.encode(
+            wasm_key
+                .to_xdr(Limits::none())
+                .map_err(|e| SimulationError::XdrError(e.to_string()))?,
+        );
 
         let req2 = GetLedgerEntriesRequest {
             jsonrpc: "2.0".to_string(),
@@ -1195,20 +1292,39 @@ impl SimulationEngine {
             },
         };
 
-        let response2: GetLedgerEntriesResponse = self.client.post(&url).json(&req2).send().await?.json().await.map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
+        let response2: GetLedgerEntriesResponse = self
+            .client
+            .post(&url)
+            .json(&req2)
+            .send()
+            .await?
+            .json()
+            .await
+            .map_err(|e| SimulationError::RpcRequestFailed(e.to_string()))?;
         let entries2 = match response2.result {
             LedgerEntriesResponseResult::Success { result } => result.entries,
-            LedgerEntriesResponseResult::Error { error } => return Err(SimulationError::NodeError(error.message)),
+            LedgerEntriesResponseResult::Error { error } => {
+                return Err(SimulationError::NodeError(error.message))
+            }
         };
 
-        let entry_meta2 = entries2.first().ok_or_else(|| SimulationError::InvalidContract("Contract code not found".to_string()))?;
-        let entry_xdr2 = entry_meta2.xdr.as_ref().ok_or_else(|| SimulationError::InvalidContract("No XDR in code ledger entry".to_string()))?;
+        let entry_meta2 = entries2.first().ok_or_else(|| {
+            SimulationError::InvalidContract("Contract code not found".to_string())
+        })?;
+        let entry_xdr2 = entry_meta2.xdr.as_ref().ok_or_else(|| {
+            SimulationError::InvalidContract("No XDR in code ledger entry".to_string())
+        })?;
         let entry_bytes2 = BASE64.decode(entry_xdr2)?;
-        let entry2 = LedgerEntry::from_xdr(&entry_bytes2, Limits::none()).map_err(|e| SimulationError::XdrError(e.to_string()))?;
+        let entry2 = LedgerEntry::from_xdr(&entry_bytes2, Limits::none())
+            .map_err(|e| SimulationError::XdrError(e.to_string()))?;
 
         let wasm_bytes = match entry2.data {
             soroban_sdk::xdr::LedgerEntryData::ContractCode(c) => c.code.to_vec(),
-            _ => return Err(SimulationError::InvalidContract("Invalid code ledger entry data type".to_string())),
+            _ => {
+                return Err(SimulationError::InvalidContract(
+                    "Invalid code ledger entry data type".to_string(),
+                ))
+            }
         };
 
         // 3. Cache and return
@@ -1244,9 +1360,17 @@ impl SimulationEngine {
         }
 
         if let Some(overrides) = ledger_overrides {
-            if !overrides.is_empty() || protocol_version.is_some() || enable_experimental.is_some() {
+            if !overrides.is_empty() || protocol_version.is_some() || enable_experimental.is_some()
+            {
                 return self
-                    .simulate_locally(contract_id, function_name, args, overrides, protocol_version, enable_experimental)
+                    .simulate_locally(
+                        contract_id,
+                        function_name,
+                        args,
+                        overrides,
+                        protocol_version,
+                        enable_experimental,
+                    )
                     .await;
             }
         }
@@ -1257,11 +1381,8 @@ impl SimulationEngine {
         // propagate so we don't hide real contract bugs.
         if let Some(runner) = &self.local_runner {
             let contract_hash = self.parse_contract_id(contract_id)?;
-            let invocation = crate::runner::ContractInvocation::new(
-                contract_hash,
-                function_name,
-                args.clone(),
-            );
+            let invocation =
+                crate::runner::ContractInvocation::new(contract_hash, function_name, args.clone());
             match runner.simulate(&invocation).await {
                 Ok(result) => {
                     tracing::debug!(
@@ -1864,7 +1985,6 @@ impl SimulationEngine {
             .await
             .into_iter()
             .take(3)
-            .cloned()
             .collect();
 
         if providers.len() < 3 {
@@ -1958,10 +2078,8 @@ impl SimulationEngine {
         for (provider, result) in successes.iter().skip(1) {
             let candidate_fingerprint = self.consensus_fingerprint(result);
             if baseline_fingerprint != candidate_fingerprint {
-                let field_diffs = Self::diff_fingerprints(
-                    &baseline_fingerprint,
-                    &candidate_fingerprint,
-                );
+                let field_diffs =
+                    Self::diff_fingerprints(&baseline_fingerprint, &candidate_fingerprint);
                 diffs.push(format!(
                     "'{}' vs '{}': {}",
                     baseline_provider.name,
@@ -2143,11 +2261,10 @@ impl SimulationEngine {
                         )
                         .await
                     {
-                        Ok((ttl_report, snapshot)) => {
+                        Ok(ttl_report) => {
                             if !ttl_report.touched_entries.is_empty() {
                                 parsed.ttl_analysis = Some(ttl_report);
                             }
-                            parsed.state_snapshot = Some(snapshot);
                         }
                         Err(e) => {
                             tracing::warn!("State analysis skipped due to RPC error: {}", e);
@@ -2175,12 +2292,12 @@ impl SimulationEngine {
                 Err(_) => continue,
             };
 
-            if !diag_event.in_contract_call {
+            if !diag_event.in_successful_contract_call {
                 continue;
             }
 
             let contract_id = match &diag_event.event.contract_id {
-                Some(Hash(h)) => Strkey::Contract(*h).to_string(),
+                Some(Hash(h)) => Strkey::Contract(StrkeyContract(*h)).to_string(),
                 None => "Host".to_string(),
             };
 
@@ -2281,7 +2398,9 @@ impl SimulationEngine {
         if let Some(cache) = &self.contract_cache {
             for key in touched_keys {
                 if let Some(entry_bytes) = cache.get_ledger_entry(key, latest_ledger) {
-                    if let Ok(entry_meta) = serde_json::from_slice::<LedgerEntryWithMeta>(&entry_bytes) {
+                    if let Ok(entry_meta) =
+                        serde_json::from_slice::<LedgerEntryWithMeta>(&entry_bytes)
+                    {
                         if let Some(live_until) = entry_meta.live_until_ledger_seq {
                             cached_reports.push(TtlEntryReport {
                                 key: entry_meta.key,
@@ -2299,7 +2418,8 @@ impl SimulationEngine {
         }
 
         if missing_keys.is_empty() {
-            let extend_ttl_suggestions = Self::build_extend_ttl_suggestions(&cached_reports, latest_ledger);
+            let extend_ttl_suggestions =
+                Self::build_extend_ttl_suggestions(&cached_reports, latest_ledger);
             return Ok(TtlAnalysisReport {
                 current_ledger: latest_ledger,
                 touched_entries: cached_reports,
@@ -2441,6 +2561,8 @@ impl SimulationEngine {
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: rpc_result.transaction_data,
+            call_graph: None,
+            state_snapshot: None,
             protocol_version: 0, // RPC version unknown here, will be updated if possible
         })
     }
@@ -2949,11 +3071,11 @@ pub fn profile_contract(
     protocol_version: Option<u32>,
     enable_experimental: Option<bool>,
 ) -> Result<SorobanResources, SimulationError> {
+    use soroban_sdk::testutils::Ledger;
     use soroban_sdk::{Env, Symbol, Val};
-    use soroban_sdk::ledger::Ledger;
 
     let env = Env::default();
-    
+
     if let Some(version) = protocol_version {
         tracing::info!("Setting simulated protocol version to {}", version);
         env.ledger().set_protocol_version(version);
@@ -2962,7 +3084,7 @@ pub fn profile_contract(
     if enable_experimental.unwrap_or(false) {
         tracing::info!("Experimental host functions enabled (via custom host config)");
         // Note: Full support for experimental functions often requires a custom Host build.
-        // For this sandbox, we ensure the protocol version is set to at least 21 
+        // For this sandbox, we ensure the protocol version is set to at least 21
         // if experimental is requested but no version is provided.
         if protocol_version.is_none() {
             env.ledger().set_protocol_version(21);
@@ -3060,23 +3182,11 @@ pub fn profile_contract_with_flamegraph(
     let _enter = span.enter();
 
     // ── Attempt binary instrumentation ───────────────────────────────────────
-    let (instrumented, func_names, use_budget_fallback) =
-        match WasmInstrumenter::new(&wasm_bytes) {
-            Ok(instrumenter) => {
-                match instrumenter.instrument(&wasm_bytes) {
-                    Ok(bytes) => {
-                        let names = instrumenter.func_names().to_vec();
-                        (bytes, names, false)
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            wasm_size_bytes = wasm_size,
-                            error = %e,
-                            "WASM instrumentation failed; falling back to budget API"
-                        );
-                        (wasm_bytes.clone(), vec![], true)
-                    }
-                }
+    let (instrumented, func_names, use_budget_fallback) = match WasmInstrumenter::new(&wasm_bytes) {
+        Ok(instrumenter) => match instrumenter.instrument(&wasm_bytes) {
+            Ok(bytes) => {
+                let names = instrumenter.func_names().to_vec();
+                (bytes, names, false)
             }
             Err(e) => {
                 tracing::error!(
@@ -3086,7 +3196,16 @@ pub fn profile_contract_with_flamegraph(
                 );
                 (wasm_bytes.clone(), vec![], true)
             }
-        };
+        },
+        Err(e) => {
+            tracing::error!(
+                wasm_size_bytes = wasm_size,
+                error = %e,
+                "WASM instrumentation failed; falling back to budget API"
+            );
+            (wasm_bytes.clone(), vec![], true)
+        }
+    };
 
     // ── Execute in soroban-sdk Env ────────────────────────────────────────────
     let env = Env::default();
@@ -3441,7 +3560,11 @@ mod tests {
         let a = make_fingerprint(100, 200, 10, 20, 30, vec!["k1".into()]);
         let b = make_fingerprint(101, 250, 10, 20, 30, vec!["k1".into(), "k2".into()]);
         let diff = SimulationEngine::diff_fingerprints(&a, &b);
-        assert_eq!(diff.len(), 3, "expected diffs for cpu, ram, and ledger keys");
+        assert_eq!(
+            diff.len(),
+            3,
+            "expected diffs for cpu, ram, and ledger keys"
+        );
         let joined = diff.join(",");
         assert!(joined.contains("cpu_instructions"));
         assert!(joined.contains("ram_bytes"));
@@ -3534,7 +3657,7 @@ mod tests {
     async fn test_simulate_from_contract_id_empty() {
         let engine = SimulationEngine::new("https://test.com".to_string());
         let result = engine
-            .simulate_from_contract_id("", "test_function", vec![], None)
+            .simulate_from_contract_id("", "test_function", vec![], None, None, None)
             .await;
         assert!(matches!(result, Err(SimulationError::NodeError(_))));
     }
@@ -3839,7 +3962,23 @@ mod tests {
     // ── Multi-auth tests ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_build_root_invocation_structure
+    fn test_build_root_invocation_structure() {
+        let contract_address = ScAddress::Contract(Hash([0u8; 32]));
+        let function_name: ScSymbol = "fn".try_into().unwrap();
+        let args = VecM::default();
+
+        let inv = SimulationEngine::build_root_invocation(
+            contract_address.clone(),
+            function_name.clone(),
+            args.clone(),
+        );
+
+        match inv.function {
+            SorobanAuthorizedFunction::ContractFn(call) => {
+                assert_eq!(call.contract_address, contract_address);
+                assert_eq!(call.function_name, function_name);
+                assert_eq!(call.args, args);
+            }
             _ => panic!("unexpected function type"),
         }
         assert_eq!(inv.sub_invocations.len(), 0);
@@ -3964,8 +4103,8 @@ mod tests {
     /// for tests that execute via the soroban-sdk Env.
     fn minimal_wasm() -> Vec<u8> {
         use wasm_encoder::{
-            CodeSection, ExportKind, ExportSection, Function, FunctionSection,
-            Module, TypeSection, ValType,
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection, Module, TypeSection,
+            ValType,
         };
         let mut module = Module::new();
 
@@ -3995,22 +4134,21 @@ mod tests {
     /// custom section required by the soroban-sdk Env. Has one exported
     /// function `add` that returns i32 (i32.const 42; end).
     fn soroban_wasm() -> Vec<u8> {
-        use soroban_sdk::xdr::{
-            ScEnvMetaEntry, ScEnvMetaEntryInterfaceVersion, WriteXdr, Limits,
-        };
+        use soroban_sdk::xdr::{Limits, ScEnvMetaEntry, ScEnvMetaEntryInterfaceVersion, WriteXdr};
         use wasm_encoder::{
-            CodeSection, CustomSection, ExportKind, ExportSection, Function,
-            FunctionSection, Module, TypeSection, ValType,
+            CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
+            Module, TypeSection, ValType,
         };
 
         // XDR-encode ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(protocol=22, pre_release=0)
-        let meta_entry = ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(
-            ScEnvMetaEntryInterfaceVersion {
+        let meta_entry =
+            ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(ScEnvMetaEntryInterfaceVersion {
                 protocol: 22,
                 pre_release: 0,
-            },
-        );
-        let meta_bytes = meta_entry.to_xdr(Limits::none()).expect("XDR encode failed");
+            });
+        let meta_bytes = meta_entry
+            .to_xdr(Limits::none())
+            .expect("XDR encode failed");
 
         let mut module = Module::new();
 
@@ -4080,9 +4218,7 @@ mod tests {
             if let Ok(Payload::ExportSection(reader)) = payload {
                 for export in reader {
                     let export = export.unwrap();
-                    if export.kind == ExternalKind::Func
-                        && export.name == "soroscope_count_0"
-                    {
+                    if export.kind == ExternalKind::Func && export.name == "soroscope_count_0" {
                         found = true;
                     }
                 }
@@ -4119,7 +4255,10 @@ mod tests {
             let parts: Vec<&str> = line.splitn(2, ' ').collect();
             assert_eq!(parts.len(), 2, "line missing space: {line}");
             assert!(parts[0].contains(';'), "line missing semicolon: {line}");
-            assert!(parts[1].parse::<u64>().is_ok(), "count not a number: {line}");
+            assert!(
+                parts[1].parse::<u64>().is_ok(),
+                "count not a number: {line}"
+            );
         }
     }
 
@@ -4172,12 +4311,8 @@ mod tests {
 
     #[test]
     fn test_profile_contract_with_flamegraph_invalid_wasm() {
-        let err = profile_contract_with_flamegraph(
-            b"not wasm".to_vec(),
-            "add".to_string(),
-            vec![],
-        )
-        .unwrap_err();
+        let err = profile_contract_with_flamegraph(b"not wasm".to_vec(), "add".to_string(), vec![])
+            .unwrap_err();
         assert!(matches!(err, SimulationError::InvalidContract(_)));
     }
 
@@ -4187,9 +4322,18 @@ mod tests {
         let (resources, profile) =
             profile_contract_with_flamegraph(wasm, "add".to_string(), vec![])
                 .expect("profiling should succeed");
-        assert!(resources.cpu_instructions > 0, "cpu_instructions should be > 0");
-        assert!(!profile.per_function.is_empty(), "per_function should be non-empty");
-        assert!(profile.total_instructions > 0, "total_instructions should be > 0");
+        assert!(
+            resources.cpu_instructions > 0,
+            "cpu_instructions should be > 0"
+        );
+        assert!(
+            !profile.per_function.is_empty(),
+            "per_function should be non-empty"
+        );
+        assert!(
+            profile.total_instructions > 0,
+            "total_instructions should be > 0"
+        );
         assert_eq!(profile.granularity, "instrumented");
     }
 
@@ -4197,8 +4341,8 @@ mod tests {
     fn test_profile_contract_with_flamegraph_unknown_function() {
         let wasm = soroban_wasm();
         // "nonexistent" is not an export in soroban_wasm
-        let err = profile_contract_with_flamegraph(wasm, "nonexistent".to_string(), vec![])
-            .unwrap_err();
+        let err =
+            profile_contract_with_flamegraph(wasm, "nonexistent".to_string(), vec![]).unwrap_err();
         assert!(matches!(err, SimulationError::InvalidContract(_)));
     }
 
@@ -4223,9 +4367,8 @@ mod tests {
     #[test]
     fn test_profile_contract_with_flamegraph_total_equals_sum() {
         let wasm = soroban_wasm();
-        let (_, profile) =
-            profile_contract_with_flamegraph(wasm, "add".to_string(), vec![])
-                .expect("profiling should succeed");
+        let (_, profile) = profile_contract_with_flamegraph(wasm, "add".to_string(), vec![])
+            .expect("profiling should succeed");
         let sum: u64 = profile.per_function.values().sum();
         assert_eq!(profile.total_instructions, sum);
     }
@@ -4233,12 +4376,14 @@ mod tests {
     #[test]
     fn test_profile_contract_with_flamegraph_flamegraph_non_empty_when_functions_called() {
         let wasm = soroban_wasm();
-        let (_, profile) =
-            profile_contract_with_flamegraph(wasm, "add".to_string(), vec![])
-                .expect("profiling should succeed");
+        let (_, profile) = profile_contract_with_flamegraph(wasm, "add".to_string(), vec![])
+            .expect("profiling should succeed");
         // flamegraph should be non-empty since at least one function was called
         if profile.total_instructions > 0 {
-            assert!(!profile.flamegraph.is_empty(), "flamegraph should be non-empty when functions were called");
+            assert!(
+                !profile.flamegraph.is_empty(),
+                "flamegraph should be non-empty when functions were called"
+            );
         }
     }
     #[test]
@@ -4248,27 +4393,34 @@ mod tests {
         let instr = WasmInstrumenter::new(&wasm).expect("parse ok");
         eprintln!("func_names: {:?}", instr.func_names());
         let instrumented = instr.instrument(&wasm).expect("instrument ok");
-        eprintln!("original size: {}, instrumented size: {}", wasm.len(), instrumented.len());
-        
+        eprintln!(
+            "original size: {}, instrumented size: {}",
+            wasm.len(),
+            instrumented.len()
+        );
+
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(&*instrumented, ());
-        
+
         // Call the wrapper soroscope_count_0 which calls add and returns the counter
         let wrapper_sym = Symbol::new(&env, "soroscope_count_0");
         let empty_args: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&env);
         env.cost_estimate().budget().reset_unlimited();
-        
+
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             env.invoke_contract::<Val>(&contract_id, &wrapper_sym, empty_args)
         }));
         match &result {
-            Ok(v) => eprintln!("wrapper ok, payload={}, decoded={}", v.get_payload(), v.get_payload() >> 8),
+            Ok(v) => eprintln!(
+                "wrapper ok, payload={}, decoded={}",
+                v.get_payload(),
+                v.get_payload() >> 8
+            ),
             Err(_) => eprintln!("wrapper panicked"),
         }
         assert!(result.is_ok(), "wrapper should succeed");
         let count = result.unwrap().get_payload() >> 8;
         assert!(count > 0, "counter should be > 0, got {count}");
     }
-
 }

@@ -94,9 +94,9 @@ fn mul_div(a: i128, b: i128, d: i128) -> Option<i128> {
     if d == 0 {
         return None;
     }
-    let a_abs = a.abs() as u128;
-    let b_abs = b.abs() as u128;
-    let d_abs = d.abs() as u128;
+    let a_abs = a.unsigned_abs();
+    let b_abs = b.unsigned_abs();
+    let d_abs = d.unsigned_abs();
 
     let (res_abs, overflow) = mul_div_u128(a_abs, b_abs, d_abs);
     if overflow || res_abs > (i128::MAX as u128) {
@@ -225,7 +225,7 @@ impl StakingRewards {
             return Err(ContractError::AlreadyInitialized);
         }
 
-        if decay_rate < 0 || decay_rate > SCALE {
+        if !(0..=SCALE).contains(&decay_rate) {
             return Err(ContractError::InvalidInput);
         }
 

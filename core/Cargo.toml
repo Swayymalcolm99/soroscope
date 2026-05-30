@@ -15,6 +15,7 @@ soroban-sdk = { version = "22.0.0", features = ["testutils"] }
 # Version aligned with the soroban-sdk 22 workspace pin.
 soroban-env-host = { version = "22", features = ["testutils"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 rusqlite = { version = "0.29", features = ["bundled"] }
 serde_json = "1.0"
@@ -44,6 +45,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 rsa = "0.9"
+wasm-encoder = { version = "0.240", features = ["wasmparser"] }
+wasmparser = "0.240"
 
 [dev-dependencies]
 proptest = "1.4.0"

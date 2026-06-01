@@ -325,6 +325,10 @@ impl LiquidityPool {
         Ok(())
     }
 
+    pub fn guard_unpause(e: Env, admin: Address, operation: u32) -> Result<(), Error> {
+        Self::guard_pause(e, admin, operation, false)
+    }
+
     pub fn set_operation_paused(
         e: Env,
         admin: Address,
@@ -349,7 +353,7 @@ impl LiquidityPool {
 
     pub fn resume_swaps(e: Env) -> Result<(), Error> {
         let admin = Self::get_admin(e.clone())?;
-        Self::guard_pause(e, admin, pause_op::SWAP, false)
+        Self::guard_unpause(e, admin, pause_op::SWAP)
     }
 
     pub fn pause_deposits(e: Env) -> Result<(), Error> {
@@ -359,7 +363,7 @@ impl LiquidityPool {
 
     pub fn resume_deposits(e: Env) -> Result<(), Error> {
         let admin = Self::get_admin(e.clone())?;
-        Self::guard_pause(e, admin, pause_op::DEPOSIT, false)
+        Self::guard_unpause(e, admin, pause_op::DEPOSIT)
     }
 
     pub fn pause_withdrawals(e: Env) -> Result<(), Error> {
@@ -369,7 +373,7 @@ impl LiquidityPool {
 
     pub fn resume_withdrawals(e: Env) -> Result<(), Error> {
         let admin = Self::get_admin(e.clone())?;
-        Self::guard_pause(e, admin, pause_op::WITHDRAW, false)
+        Self::guard_unpause(e, admin, pause_op::WITHDRAW)
     }
 
     pub fn emergency_pause_all(e: Env, approvers: Vec<Address>) -> Result<(), Error> {

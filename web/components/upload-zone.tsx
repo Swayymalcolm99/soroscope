@@ -174,6 +174,11 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
   const [uploadState, setUploadState] = useState<UploadState>('idle');
   const [droppedFile, setDroppedFile] = useState<DroppedFile | null>(null);
   const [errorMessage, setErrorMessage] = useState<string>('');
+  const [unexpectedError, setUnexpectedError] = useState<Error | null>(null);
+
+  if (unexpectedError) {
+    throw unexpectedError;
+  }
 
   // ── Drop handling ────────────────────────────────────────────────────────────
 
@@ -185,59 +190,54 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
       setErrorMessage('');
 
       const reader = new FileReader();
-      reader.onload = () => {
-        const buffer = reader.result as ArrayBuffer;
-        if (buffer.byteLength < 4) {
-          setErrorMessage('Invalid file: File size is too small to be a valid WebAssembly binary.');
-          setUploadState('error');
-          setDroppedFile(null);
-          return;
-        }
-
-        const header = new Uint8Array(buffer, 0, 4);
-        // Magic number: \0asm (0x00 0x61 0x73 0x6d)
-        const isWasmMagic =
-          header[0] === 0x00 &&
-          header[1] === 0x61 &&
-          header[2] === 0x73 &&
-          header[3] === 0x6d;
-
-        if (!isWasmMagic) {
-          setErrorMessage(
-            'Invalid file: The file header does not match the WebAssembly magic number (\\0asm).'
-          );
-          setUploadState('error');
-          setDroppedFile(null);
-          return;
-        }
-
+      reader.onload = (event) => {
         setTimeout(() => {
-          setUploadState('success');
-          onFileReady?.(file);
-        }, 1500); // 1.5-second scan window
-      };
+          try {
+            const arrayBuffer = event.target?.result as ArrayBuffer;
+            if (!arrayBuffer) throw new Error('Failed to read file content');
 
+            if (arrayBuffer.byteLength < 8) {
+              throw new Error('File is too small to be a valid WebAssembly module');
+            }
+
+            const view = new DataView(arrayBuffer);
+            
+            const magicNumber = view.getUint32(0, false);
+            if (magicNumber !== 0x0061736d) {
+              throw new Error('Invalid WASM magic number. File is not a valid WebAssembly module');
+            }
+
+            const version = view.getUint32(4, true);
+            if (version !== 1) {
+              throw new Error(`Unsupported WASM version: ${version}. Expected version 1`);
+            }
+
+            setUploadState('success');
+            onFileReady?.(file);
+          } catch (error) {
+            setErrorMessage(error instanceof Error ? error.message : 'Failed to parse WASM metadata');
+            setUploadState('error');
+            setDroppedFile(null);
+          }
+        }, 800);
+      };
+      
       reader.onerror = () => {
-        setErrorMessage('Failed to read contract file.');
+        setErrorMessage(reader.error?.message ?? 'Unable to read the selected file');
         setUploadState('error');
         setDroppedFile(null);
       };
 
-      reader.readAsArrayBuffer(file);
+      try {
+        reader.readAsArrayBuffer(file);
+      } catch (error) {
+        setErrorMessage(error instanceof Error ? error.message : 'Unable to start reading the selected file');
+        setUploadState('error');
+        setDroppedFile(null);
+      }
     },
     [onFileReady]
   );
-
-  const wasmValidator = useCallback((file: File) => {
-    const extension = file.name.split('.').pop()?.toLowerCase();
-    if (extension !== 'wasm') {
-      return {
-        code: 'file-invalid-type',
-        message: `"${file.name}" was rejected — only .wasm files are accepted (got .${extension || 'unknown'})`,
-      };
-    }
-    return null;
-  }, []);
 
   const onDropRejected = useCallback((rejections: FileRejection[]) => {
     const first = rejections[0];
@@ -249,6 +249,17 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
     );
     setUploadState('error');
     setDroppedFile(null);
+  }, []);
+
+  const wasmValidator = useCallback((file: File) => {
+    const extension = file.name.split('.').pop()?.toLowerCase();
+    if (extension !== 'wasm') {
+      return {
+        code: 'file-invalid-type',
+        message: `"${file.name}" was rejected — only .wasm files are accepted (got .${extension || 'unknown'})`,
+      };
+    }
+    return null;
   }, []);
 
   // ── Dropzone config ──────────────────────────────────────────────────────────
@@ -273,6 +284,7 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
     setUploadState('idle');
     setDroppedFile(null);
     setErrorMessage('');
+    setUnexpectedError(null);
   };
 
   // ── Dynamic border & bg classes ──────────────────────────────────────────────

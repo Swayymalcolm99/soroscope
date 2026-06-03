@@ -1,6 +1,7 @@
 import { WalletModal } from "../components/WalletModal";
 import { ConnectButton } from "../components/ConnectButton";
 import { useState } from 'react';
+import Head from 'next/head';
 import { ResultViewer } from '../components/Resultviewer';
 import { InvocationHistory, useInvocationHistory } from '../components/InnovocationHistory';
 import { NutritionLabel } from '../components/NutritionLabel';
@@ -23,14 +24,33 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState<'explorer' | 'history'>('explorer');
   const { history, addToHistory } = useInvocationHistory();
+  const [wasmFile, setWasmFile] = useState<File | null>(null);
+  const [wasmData, setWasmData] = useState<string | null>(null);
 
-  const handleSimulate = async (inputs: Record<string, any>) => {
+  const handleSimulate = async (inputs: Record<string, any>, customWasmData?: string) => {
     setLoading(true);
     let errorType: string | undefined;
+    const activeWasmData = customWasmData || wasmData;
     try {
       const report = await analyzeService.analyze({
         contract_id: contractId,
         function_name: selectedFunction.name,
+      const url = activeWasmData ? 'http://localhost:8080/analyze/wasm' : 'http://localhost:8080/analyze';
+      const body = activeWasmData
+        ? {
+            wasm_bytes: activeWasmData,
+            function_name: selectedFunction.name,
+            args: Object.values(inputs).map(val => String(val)),
+          }
+        : {
+            contract_id: contractId,
+            function_name: selectedFunction.name,
+          };
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
       });
 
       if (!response.ok) {
@@ -136,7 +156,14 @@ export default function Home() {
   const analysisReport = currentResult?.analysisReport ?? currentResult?.resourceCost;
 
   return (
-    <div style={{ minHeight: '100vh', backgroundColor: '#0f1117' }}>
+    <>
+      <Head>
+        <title>SoroScope - Soroban Smart Contract Resource Analyzer</title>
+        <meta name="description" content="Explore, test, and analyze the CPU, RAM, and ledger footprint of Soroban smart contracts with absolute precision, utilizing live node queries and direct WASM bytecode analysis." />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <link rel="icon" href="/favicon.ico" />
+      </Head>
+      <div style={{ minHeight: '100vh', backgroundColor: '#0f1117' }}>
       {/* Header */}
       <header
         style={{
@@ -208,6 +235,31 @@ export default function Home() {
                  console.log('[UploadZone] Contract ready for analysis:', file.name, file.size, 'bytes');
                  handleFileAnalysis(file);
                }}
+            <UploadZone
+              onFileReady={(file) => {
+                console.log('[UploadZone] Contract ready for analysis:', file.name, file.size, 'bytes');
+                setWasmFile(file);
+                const reader = new FileReader();
+                reader.onload = async (e) => {
+                  const arrayBuffer = e.target?.result as ArrayBuffer;
+                  const bytes = new Uint8Array(arrayBuffer);
+                  let binary = '';
+                  const len = bytes.byteLength;
+                  for (let i = 0; i < len; i++) {
+                    binary += String.fromCharCode(bytes[i]);
+                  }
+                  const base64 = window.btoa(binary);
+                  setWasmData(base64);
+                  // Trigger initial simulation immediately
+                  await handleSimulate({}, base64);
+                };
+                reader.readAsArrayBuffer(file);
+              }}
+              onReset={() => {
+                setWasmFile(null);
+                setWasmData(null);
+                setCurrentResult(null);
+              }}
             />
           </ErrorBoundary>
         </div>
@@ -245,6 +297,24 @@ export default function Home() {
           <p style={{ margin: '8px 0 0 0', fontSize: '12px', color: '#8b949e' }}>
             Contract ID: <code style={{ color: '#00d9ff' }}>{contractId.substring(0, 20)}...</code>
           </p>
+          {wasmFile && (
+            <div
+              style={{
+                marginTop: '16px',
+                padding: '12px',
+                backgroundColor: 'rgba(52, 211, 153, 0.08)',
+                border: '1px solid rgba(52, 211, 153, 0.25)',
+                borderRadius: '6px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+              }}
+            >
+              <span style={{ color: '#34d399', fontSize: '12px', fontWeight: '600' }}>Active WASM:</span>
+              <code style={{ color: '#c9d1d9', fontSize: '12px', fontFamily: 'monospace' }}>{wasmFile.name}</code>
+              <span style={{ color: '#8b949e', fontSize: '11px' }}>({(wasmFile.size / 1024).toFixed(1)} KB)</span>
+            </div>
+          )}
         </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px', marginBottom: '24px' }}>
@@ -463,5 +533,6 @@ export default function Home() {
       {/* Wallet Modal */}
       <WalletModal />
     </div>
+    </>
   );
 }

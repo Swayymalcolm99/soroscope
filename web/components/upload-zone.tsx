@@ -171,6 +171,10 @@ export interface UploadZoneProps {
 }
 
 export function UploadZone({ onFileReady }: UploadZoneProps) {
+  onReset?: () => void;
+}
+
+export function UploadZone({ onFileReady, onReset }: UploadZoneProps) {
   const [uploadState, setUploadState] = useState<UploadState>('idle');
   const [droppedFile, setDroppedFile] = useState<DroppedFile | null>(null);
   const [errorMessage, setErrorMessage] = useState<string>('');
@@ -189,6 +193,7 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
       setUploadState('scanning');
       setErrorMessage('');
 
+      // Simulate async scan (replace with real WASM parsing logic)
       const reader = new FileReader();
       reader.onload = (event) => {
         setTimeout(() => {
@@ -246,6 +251,8 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
     const customMessage = first?.errors?.[0]?.message;
     setErrorMessage(
       customMessage || `"${fileName}" was rejected — only .wasm files are accepted (got ${ext})`
+    setErrorMessage(
+      `"${fileName}" was rejected — only .wasm files are accepted (got ${ext})`
     );
     setUploadState('error');
     setDroppedFile(null);
@@ -261,6 +268,13 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
     }
     return null;
   }, []);
+  const onDragEnter = useCallback(() => {
+    if (uploadState !== 'scanning') setUploadState('hover');
+  }, [uploadState]);
+
+  const onDragLeave = useCallback(() => {
+    if (uploadState === 'hover') setUploadState('idle');
+  }, [uploadState]);
 
   // ── Dropzone config ──────────────────────────────────────────────────────────
 
@@ -272,6 +286,9 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
       'application/wasm': ['.wasm'],
       'application/octet-stream': ['.wasm'],
     },
+    onDragEnter,
+    onDragLeave,
+    accept: { 'application/wasm': ['.wasm'] },
     maxFiles: 1,
     noClick: uploadState === 'scanning',
     noDrag: uploadState === 'scanning',
@@ -285,6 +302,7 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
     setDroppedFile(null);
     setErrorMessage('');
     setUnexpectedError(null);
+    onReset?.();
   };
 
   // ── Dynamic border & bg classes ──────────────────────────────────────────────

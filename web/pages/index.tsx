@@ -480,6 +480,19 @@ export default function Home() {
                         state_snapshot: currentResult.stateSnapshot
                       }} />
                   {analysisReport && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCurrentResult(null);
+                        const resetBtn = document.getElementById('wasm-upload-reset-btn');
+                        if (resetBtn) resetBtn.click();
+                      }}
+                      className="mt-4 px-4 py-2 bg-slate-800 text-slate-300 rounded hover:bg-slate-700 transition"
+                    >
+                      Clear analysis
+                    </button>
+                  )}
+                  {currentResult?.resourceCost && (
                     <div className="mt-4">
                     <div className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-4">
                       <NutritionLabel

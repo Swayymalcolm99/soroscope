@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, log, Address, Env, String, Vec,
+};
 
 /// Granular pause types using bitmask for efficient storage
 /// Each bit represents a different pausable operation
@@ -74,6 +76,53 @@ pub enum GuardError {
     AlreadyInitialized = 6,
 }
 
+/// Standardized event actions emitted by every successful guard action.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub enum EmergencyGuardAction {
+    Initialized,
+    PauseSet,
+    EmergencyPause,
+    Resume,
+    AdminAdded,
+    AdminRemoved,
+    AdminRotated,
+}
+
+/// Standardized event payload for EmergencyGuard administrative actions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyGuardEvent {
+    pub action: EmergencyGuardAction,
+    pub admin: Option<Address>,
+    pub operation: u32,
+    pub paused: bool,
+    pub threshold: u32,
+    pub admin_count: u32,
+    pub approver_count: u32,
+}
+
+fn action_topic(env: &Env, action: EmergencyGuardAction) -> String {
+    match action {
+        EmergencyGuardAction::Initialized => String::from_str(env, "initialized"),
+        EmergencyGuardAction::PauseSet => String::from_str(env, "pause_set"),
+        EmergencyGuardAction::EmergencyPause => String::from_str(env, "emergency_pause"),
+        EmergencyGuardAction::Resume => String::from_str(env, "resume"),
+        EmergencyGuardAction::AdminAdded => String::from_str(env, "admin_added"),
+        EmergencyGuardAction::AdminRemoved => String::from_str(env, "admin_removed"),
+        EmergencyGuardAction::AdminRotated => String::from_str(env, "admin_rotated"),
+    }
+}
+
+fn emit_guard_event(env: &Env, event: EmergencyGuardEvent) {
+    env.events().publish(
+        (
+            String::from_str(env, "EmergencyGuard"),
+            action_topic(env, event.action),
+        ),
+        event,
+    );
+}
 /// Result type for guard operations
 // Result type for guard operations replaced inline
 
@@ -145,6 +194,19 @@ impl EmergencyGuard {
             .instance()
             .set(&DataKey::PauseState, &PauseType::new(0));
 
+        emit_guard_event(
+            &env,
+            EmergencyGuardEvent {
+                action: EmergencyGuardAction::Initialized,
+                admin: None,
+                operation: 0,
+                paused: false,
+                threshold,
+                admin_count: admins.len(),
+                approver_count: 0,
+            },
+        );
+
         Ok(())
     }
 
@@ -184,13 +246,23 @@ impl EmergencyGuard {
             .instance()
             .set(&DataKey::PauseState, &pause_state);
 
-        // Emit standardized EmergencyGuard event
-        env.events().publish(
-            (
-                String::from_str(&env, "emergency_guard.set_pause"),
-                admin.clone(),
-            ),
-            (operation, paused),
+        emit_guard_event(
+            &env,
+            EmergencyGuardEvent {
+                action: EmergencyGuardAction::PauseSet,
+                admin: Some(admin),
+                operation,
+                paused,
+                threshold: Self::get_threshold(env.clone()),
+                admin_count: Self::get_admins(env.clone()).len(),
+                approver_count: 1,
+            },
+        );
+        log!(
+            &env,
+            "Pause state updated: op={}, paused={}",
+            operation,
+            paused
         );
         Ok(())
     }
@@ -206,13 +278,19 @@ impl EmergencyGuard {
             .instance()
             .set(&DataKey::PauseState, &pause_state);
 
-        env.events().publish(
-            (String::from_str(
-                &env,
-                "emergency_guard.emergency_pause_all",
-            ),),
-            (approvers.clone(),),
+        emit_guard_event(
+            &env,
+            EmergencyGuardEvent {
+                action: EmergencyGuardAction::EmergencyPause,
+                admin: None,
+                operation: u32::MAX,
+                paused: true,
+                threshold: Self::get_threshold(env.clone()),
+                admin_count: Self::get_admins(env.clone()).len(),
+                approver_count: approvers.len(),
+            },
         );
+        log!(&env, "Emergency pause all activated");
         Ok(())
     }
 
@@ -225,10 +303,19 @@ impl EmergencyGuard {
             .instance()
             .set(&DataKey::PauseState, &pause_state);
 
-        env.events().publish(
-            (String::from_str(&env, "emergency_guard.resume_all"),),
-            (approvers.clone(),),
+        emit_guard_event(
+            &env,
+            EmergencyGuardEvent {
+                action: EmergencyGuardAction::Resume,
+                admin: None,
+                operation: u32::MAX,
+                paused: false,
+                threshold: Self::get_threshold(env.clone()),
+                admin_count: Self::get_admins(env.clone()).len(),
+                approver_count: approvers.len(),
+            },
         );
+        log!(&env, "Resume all activated");
         Ok(())
     }
 
@@ -244,13 +331,19 @@ impl EmergencyGuard {
         if !admins.iter().any(|a| a == new_admin) {
             admins.push_back(new_admin.clone());
             env.storage().instance().set(&DataKey::Admins, &admins);
-            env.events().publish(
-                (
-                    String::from_str(&env, "emergency_guard.admin_added"),
-                    new_admin.clone(),
-                ),
-                (),
+            emit_guard_event(
+                &env,
+                EmergencyGuardEvent {
+                    action: EmergencyGuardAction::AdminAdded,
+                    admin: Some(new_admin.clone()),
+                    operation: 0,
+                    paused: false,
+                    threshold: Self::get_threshold(env.clone()),
+                    admin_count: admins.len(),
+                    approver_count: approvers.len(),
+                },
             );
+            log!(&env, "Admin added: {}", new_admin);
         }
 
         Ok(())
@@ -286,13 +379,19 @@ impl EmergencyGuard {
         }
 
         env.storage().instance().set(&DataKey::Admins, &new_admins);
-        env.events().publish(
-            (
-                String::from_str(&env, "emergency_guard.admin_removed"),
-                admin.clone(),
-            ),
-            (),
+        emit_guard_event(
+            &env,
+            EmergencyGuardEvent {
+                action: EmergencyGuardAction::AdminRemoved,
+                admin: Some(admin.clone()),
+                operation: 0,
+                paused: false,
+                threshold,
+                admin_count: new_admins.len(),
+                approver_count: approvers.len(),
+            },
         );
+        log!(&env, "Admin removed: {}", admin);
         Ok(())
     }
 
@@ -329,14 +428,19 @@ impl EmergencyGuard {
         }
 
         env.storage().instance().set(&DataKey::Admins, &new_admins);
-        env.events().publish(
-            (
-                soroban_sdk::String::from_str(&env, "emergency_guard.admin_rotated"),
-                old_admin,
-                new_admin,
-            ),
-            (),
+        emit_guard_event(
+            &env,
+            EmergencyGuardEvent {
+                action: EmergencyGuardAction::AdminRotated,
+                admin: Some(new_admin.clone()),
+                operation: 0,
+                paused: false,
+                threshold,
+                admin_count: new_admins.len(),
+                approver_count: approvers.len(),
+            },
         );
+        log!(&env, "Admin rotated: {} to {}", old_admin, new_admin);
         Ok(())
     }
 

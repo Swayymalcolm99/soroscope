@@ -9,7 +9,7 @@
 //! ## Safety Model
 //!
 //! 1. **Atomic rollback**: Soroban reverts all state changes if any step panics.
-//!    If the borrower fails to repay, the balance check at step 9 panics and
+//!    If the borrower fails to repay, the balance check at step 9 fails and
 //!    the transfer at step 6 is rolled back — funds never leave the vault.
 //!
 //! 2. **Reentrancy guard**: A `FlashLoanActive` flag prevents nested flash
@@ -393,7 +393,9 @@ impl FlashLoanVault {
     /// `receiver.execute_operation(token, amount, fee, initiator)`.
     ///
     /// After the callback returns, the vault verifies that its token balance
-    /// is at least `pre_balance + fee`. If not, the entire transaction reverts.
+    /// is at least `pre_balance + fee`, which proves the callback returned the
+    /// original `amount` plus the required fee. If not, the entire transaction
+    /// reverts.
     ///
     /// # Arguments
     /// * `initiator` – the address initiating the flash loan (must authorize)
@@ -452,12 +454,15 @@ impl FlashLoanVault {
         let receiver_client = FlashLoanReceiverClient::new(&e, &receiver);
         receiver_client.execute_operation(&token_addr, &amount, &fee, &initiator);
 
-        // 10. Verify repayment: vault balance must be >= pre_balance + fee.
+        // 10. Verify repayment: after lending `amount`, the receiver must
+        // return `amount + fee`, leaving the vault with its original balance
+        // plus the fee.
+        let required_balance = pre_balance + fee;
         let post_balance = token.balance(&e.current_contract_address());
-        if post_balance < pre_balance + fee {
-            // This panic causes the entire transaction to revert.
+        if post_balance < required_balance {
             // The transfer at step 8 is rolled back — funds are safe.
-            panic!("flash loan not repaid");
+            set_flash_loan_active(&e, false);
+            return Err(Error::LoanNotRepaid);
         }
 
         // 11. Clear reentrancy guard.

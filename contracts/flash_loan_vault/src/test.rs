@@ -485,6 +485,46 @@ fn test_flash_loan_borrow_entire_vault() {
 // }
 
 #[test]
+fn test_flash_loan_no_repay_returns_error() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    let receiver_id = s.e.register(BadReceiver, ());
+    let initiator = Address::generate(&s.e);
+
+    let result = s
+        .vault_client
+        .try_flash_loan(&initiator, &receiver_id, &5_000);
+
+    assert_eq!(result, Err(Ok(Error::LoanNotRepaid)));
+    assert_eq!(s.vault_client.get_available(), 10_000);
+    assert_eq!(s.token_client.balance(&receiver_id), 0);
+}
+
+#[test]
+fn test_flash_loan_partial_repay_returns_error() {
+    let s = setup();
+    fund_vault(&s, 10_000);
+
+    // Set fee so partial repay (principal only) is insufficient.
+    s.vault_client.set_fee(&100);
+
+    let receiver_id = s.e.register(partial::PartialReceiver, ());
+    let receiver_client = partial::PartialReceiverClient::new(&s.e, &receiver_id);
+    receiver_client.set_vault(&s.vault_id);
+
+    let initiator = Address::generate(&s.e);
+
+    let result = s
+        .vault_client
+        .try_flash_loan(&initiator, &receiver_id, &5_000);
+
+    assert_eq!(result, Err(Ok(Error::LoanNotRepaid)));
+    assert_eq!(s.vault_client.get_available(), 10_000);
+    assert_eq!(s.vault_client.get_total_deposited(), 10_000);
+}
+
+#[test]
 fn test_flash_loan_overpay() {
     let s = setup();
     fund_vault(&s, 10_000);

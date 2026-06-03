@@ -21,6 +21,25 @@ export interface ContractInput {
   optional?: boolean;
 }
 
+export interface ResourceCost {
+  fee?: string;
+  cost_stroops?: number;
+  cpu_instructions: number;
+  ram_bytes: number;
+  ledger_read_bytes: number;
+  ledger_write_bytes: number;
+  transaction_size_bytes: number;
+  testnet_averages?: TestnetAverages;
+}
+
+export interface TestnetAverages {
+  cpu_instructions: number;
+  ram_bytes: number;
+  ledger_read_bytes: number;
+  ledger_write_bytes: number;
+  transaction_size_bytes: number;
+}
+
 export interface InvocationResult {
   id: string;
   functionName: string;
@@ -40,6 +59,7 @@ export interface InvocationResult {
   analysisReport?: ResourceReport;
   /** Backward-compatible alias for older stored history entries. */
   resourceCost?: ResourceReport;
+  resourceCost?: ResourceCost;
   callGraph?: CallGraph;
   callGraphMermaid?: string;
   stateSnapshot?: SimulationStateSnapshot;

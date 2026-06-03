@@ -9,6 +9,9 @@ import { FunctionSidebar } from '../components/FunctionSidebar';
 import { ContractInteraction } from '../components/ContractInteraction';
 import { MOCK_CONTRACT_FUNCTIONS, generateMockResult } from '../lib/sorobantypes';
 import type { AnalyzeResponse, ContractFunction, InvocationResult } from '../lib/sorobantypes';
+import { GasUsageChart } from '../components/GasUsageChart';
+import { MOCK_CONTRACT_FUNCTIONS, generateMockResult, generateMockResourceCost } from '../lib/sorobantypes';
+import type { ContractFunction, InvocationResult } from '../lib/sorobantypes';
 import { UploadZone } from '../components/upload-zone';
 import { extractErrorDetails, createUserFriendlyMessage } from '../lib/errorHandling';
 import { ErrorBoundary } from '../components/ErrorBoundary';
@@ -419,12 +422,22 @@ export default function Home() {
                       }} />
                   {analysisReport && (
                     <div className="mt-4">
+                    <div className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-4">
                       <NutritionLabel
                         cpu_instructions={analysisReport.cpu_instructions}
                         ram_bytes={analysisReport.ram_bytes}
                         ledger_read_bytes={analysisReport.ledger_read_bytes}
                         ledger_write_bytes={analysisReport.ledger_write_bytes}
                         transaction_size_bytes={analysisReport.transaction_size_bytes}
+                      />
+                      <GasUsageChart
+                        cpu_instructions={currentResult.resourceCost.cpu_instructions}
+                        ram_bytes={currentResult.resourceCost.ram_bytes}
+                        ledger_read_bytes={currentResult.resourceCost.ledger_read_bytes}
+                        ledger_write_bytes={currentResult.resourceCost.ledger_write_bytes}
+                        transaction_size_bytes={currentResult.resourceCost.transaction_size_bytes}
+                        cost_stroops={currentResult.resourceCost.cost_stroops}
+                        testnetAverages={currentResult.resourceCost.testnet_averages}
                       />
                     </div>
                   </>

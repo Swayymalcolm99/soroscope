@@ -13,8 +13,10 @@ pub use emergency_guard;
 #[cfg(test)]
 mod test;
 #[cfg(test)]
-mod test_granular_pause;
 mod test_admin_rotation;
+#[cfg(test)]
+mod test_granular_pause;
+#[cfg(test)]
 mod test_multisig;
 
 pub use crate::contract::Token;

@@ -13,6 +13,7 @@ struct Args {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct Config {
     max_gas_limit: u64,
     min_gas_price: u64,
@@ -173,43 +174,40 @@ async fn handle_rpc(
                     "id": 1
                 });
 
-                match state
+                if let Ok(gas_resp) = state
                     .client
                     .post(&state.rpc_url)
                     .json(&gas_req)
                     .send()
                     .await
                 {
-                    Ok(gas_resp) => {
-                        let gas_body: serde_json::Value = gas_resp.json().await.unwrap_or_default();
-                        let gas_used = gas_body
-                            .get("result")
-                            .and_then(|r| r.as_str())
-                            .and_then(|s| u64::from_str_radix(&s[2..], 16).ok())
-                            .unwrap_or(0);
+                    let gas_body: serde_json::Value = gas_resp.json().await.unwrap_or_default();
+                    let gas_used = gas_body
+                        .get("result")
+                        .and_then(|r| r.as_str())
+                        .and_then(|s| u64::from_str_radix(&s[2..], 16).ok())
+                        .unwrap_or(0);
 
-                        if gas_used > state.config.max_gas_limit {
-                            println!(
-                                "Gas limit exceeded: {} > {}",
-                                gas_used, state.config.max_gas_limit
-                            );
-                            return Json(RpcResponse {
-                                jsonrpc: "2.0".to_string(),
-                                result: None,
-                                error: Some(RpcError {
-                                    code: -32000,
-                                    message: format!(
-                                        "Gas limit exceeded: {} > {}",
-                                        gas_used, state.config.max_gas_limit
-                                    ),
-                                }),
-                                id: req.id,
-                            });
-                        }
-
-                        println!("Simulation passed: gas={}", gas_used);
+                    if gas_used > state.config.max_gas_limit {
+                        println!(
+                            "Gas limit exceeded: {} > {}",
+                            gas_used, state.config.max_gas_limit
+                        );
+                        return Json(RpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            result: None,
+                            error: Some(RpcError {
+                                code: -32000,
+                                message: format!(
+                                    "Gas limit exceeded: {} > {}",
+                                    gas_used, state.config.max_gas_limit
+                                ),
+                            }),
+                            id: req.id,
+                        });
                     }
-                    Err(_) => {}
+
+                    println!("Simulation passed: gas={}", gas_used);
                 }
             }
             Err(_) => {

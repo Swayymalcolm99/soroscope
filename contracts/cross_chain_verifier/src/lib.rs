@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Vec, Bytes};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,19 +27,23 @@ impl CrossChainVerifier {
     pub fn update_root(env: Env, block_height: u32, new_root: BytesN<32>) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
-        
-        env.storage().persistent().set(&DataKey::StateRoot(block_height), &new_root);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::StateRoot(block_height), &new_root);
     }
 
     /// Retrieve a stored state root by block height.
     pub fn get_root(env: Env, block_height: u32) -> Option<BytesN<32>> {
-        env.storage().persistent().get(&DataKey::StateRoot(block_height))
+        env.storage()
+            .persistent()
+            .get(&DataKey::StateRoot(block_height))
     }
 
     /// Verifies a Binary Merkle Tree proof.
     /// In a cross-chain context, this allows proving that a specific message or transaction
     /// (the `leaf`) was included in the block matching `block_height` state root.
-    /// 
+    ///
     /// * `block_height`: The block height of the state root to verify against.
     /// * `leaf`: The hash of the cross-chain message to be verified.
     /// * `proof`: A list of sibling hashes forming the Merkle proof.
@@ -75,7 +79,7 @@ impl CrossChainVerifier {
                 combined[0..32].copy_from_slice(&current_hash);
                 combined[32..64].copy_from_slice(&sibling);
             }
-            
+
             // Compute sha256 of the combined 64 bytes
             let combined_bytes = Bytes::from_slice(&env, &combined);
             current_hash = env.crypto().sha256(&combined_bytes).to_array();

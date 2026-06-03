@@ -1,10 +1,17 @@
 use crate::errors::AppError;
 use axum::{extract::Request, http::header, middleware::Next, response::Response, Extension, Json};
-use base64::{engine::general_purpose::STANDARD as BASE64, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine};
+use base64::{
+    engine::general_purpose::STANDARD as BASE64,
+    engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine,
+};
 use ed25519_dalek::{Signature as Ed25519Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rand::RngCore;
-use rsa::{pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey}, RsaPrivateKey, RsaPublicKey, traits::PublicKeyParts};
+use rsa::{
+    pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey},
+    traits::PublicKeyParts,
+    RsaPrivateKey, RsaPublicKey,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use soroban_sdk::xdr::{
@@ -50,6 +57,7 @@ impl AuthState {
                 seed
             }
         };
+        let signing_key = SigningKey::from_bytes(&seed);
         let server_public_key = signing_key.verifying_key().to_bytes();
 
         let priv_key = if let Some(pem) = jwt_private_key_pem {
@@ -64,7 +72,9 @@ impl AuthState {
         let encoding_key = EncodingKey::from_rsa_pem(pem_str.as_bytes()).unwrap();
 
         let pub_key = RsaPublicKey::from(&priv_key);
-        let pub_pem = pub_key.to_public_key_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        let pub_pem = pub_key
+            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap();
         let decoding_key = DecodingKey::from_rsa_pem(pub_pem.as_bytes()).unwrap();
 
         let n = BASE64_URL.encode(pub_key.n().to_bytes_be());
@@ -322,12 +332,12 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
 
     for ds in sigs {
         let sig_bytes: &[u8] = ds.signature.as_ref();
-        let Ok(sig) = Ed25519Signature::from_bytes(sig_bytes) else {
+        let Ok(sig) = Ed25519Signature::try_from(sig_bytes) else {
             continue;
         };
 
         if ds.hint.0 == server_hint {
-            if let Ok(vk) = PublicKey::from_bytes(&state.server_public_key) {
+            if let Ok(vk) = VerifyingKey::from_bytes(&state.server_public_key) {
                 if vk.verify(&hash, &sig).is_ok() {
                     server_ok = true;
                 }
@@ -335,7 +345,7 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
         }
 
         if ds.hint.0 == client_hint {
-            if let Ok(vk) = PublicKey::from_bytes(&client_key) {
+            if let Ok(vk) = VerifyingKey::from_bytes(&client_key) {
                 if vk.verify(&hash, &sig).is_ok() {
                     client_ok = true;
                 }
@@ -366,12 +376,8 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
     };
 
     let header = Header::new(Algorithm::RS256);
-    encode(
-        &header,
-        &claims,
-        &state.encoding_key,
-    )
-    .map_err(|e| AppError::Internal(format!("JWT encode error: {e}")))
+    encode(&header, &claims, &state.encoding_key)
+        .map_err(|e| AppError::Internal(format!("JWT encode error: {e}")))
 }
 
 #[utoipa::path(
@@ -489,15 +495,13 @@ pub async fn auth_middleware(
         .ok_or_else(|| AppError::Unauthorized("Expected Bearer token".into()))?;
 
     let validation = Validation::new(Algorithm::RS256);
-    let token_data = decode::<Claims>(
-        token,
-        &state.decoding_key,
-        &validation,
-    )
-    .map_err(|e| AppError::Unauthorized(format!("Invalid token: {e}")))?;
+    let token_data = decode::<Claims>(token, &state.decoding_key, &validation)
+        .map_err(|e| AppError::Unauthorized(format!("Invalid token: {e}")))?;
 
     if !token_data.claims.scopes.contains(&"simulate".to_string()) {
-        return Err(AppError::Unauthorized("Missing required scope 'simulate'".into()));
+        return Err(AppError::Unauthorized(
+            "Missing required scope 'simulate'".into(),
+        ));
     }
 
     Ok(next.run(req).await)

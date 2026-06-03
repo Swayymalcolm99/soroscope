@@ -9,6 +9,7 @@ use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
 use emergency_guard::{EmergencyGuard, PauseType};
 use soroban_sdk::{contract, contractimpl, vec, Address, Env, String, Vec};
 use emergency_guard::{EmergencyGuard, GuardError, PauseType};
+use emergency_guard::{DataKey as GuardDataKey, EmergencyGuard, GuardError, PauseType};
 use soroban_sdk::{contract, contractimpl, vec, Address, Env, String, Vec};
 
 fn require_not_paused(e: &Env, operation: u32) {
@@ -129,6 +130,10 @@ impl TokenTrait for Token {
         let admin = read_administrator(&e);
         // admin.require_auth(); // Handled by EmergencyGuard
         e.storage().instance().extend_ttl(100, 100);
+        if admin == new_admin {
+            write_administrator(&e, &new_admin);
+            return;
+        }
 
         EmergencyGuard::rotate_admin(e.clone(), vec![&e, admin.clone()], admin.clone(), new_admin.clone())
             .expect("failed to rotate token admin");
@@ -144,6 +149,30 @@ impl TokenTrait for Token {
             .expect("failed to remove old admin via EmergencyGuard");
 
         e.storage().instance().extend_ttl(100, 100);
+        let admins = EmergencyGuard::get_admins(e.clone());
+        let mut rotated_admins = Vec::new(&e);
+        let mut has_new_admin = false;
+        let mut replaced_old_admin = false;
+        for guard_admin in admins.iter() {
+            if guard_admin == new_admin {
+                has_new_admin = true;
+            }
+            if guard_admin == admin {
+                replaced_old_admin = true;
+                if !has_new_admin {
+                    rotated_admins.push_back(new_admin.clone());
+                    has_new_admin = true;
+                }
+            } else {
+                rotated_admins.push_back(guard_admin);
+            }
+        }
+        if !replaced_old_admin && !has_new_admin {
+            rotated_admins.push_back(new_admin.clone());
+        }
+        e.storage()
+            .instance()
+            .set(&GuardDataKey::Admins, &rotated_admins);
         write_administrator(&e, &new_admin);
     }
 

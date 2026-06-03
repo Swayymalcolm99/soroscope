@@ -1,7 +1,5 @@
-#![cfg(test)]
-
 use crate::{Domain, Transfer, TypedDataAuth};
-use soroban_sdk::testutils::{Address as _, BytesN as _};
+use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{Address, BytesN, Env, String};
 
 #[test]

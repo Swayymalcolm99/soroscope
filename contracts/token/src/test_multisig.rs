@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 //! Threshold multi-sig tests for the token contract.
 //!
 //! These tests verify N-of-M multi-sig admin capabilities using the
@@ -12,6 +10,11 @@ use soroban_sdk::{testutils::Address as _, vec, Address, Env};
 use emergency_guard::{EmergencyGuard, EmergencyGuardClient};
 
 fn setup_guard<'a>(env: &'a Env, admins: &[Address], threshold: u32) -> (EmergencyGuardClient<'a>, Address) {
+fn setup_guard<'a>(
+    env: &'a Env,
+    admins: &[Address],
+    threshold: u32,
+) -> (EmergencyGuardClient<'a>, Address) {
     let contract_id = env.register(EmergencyGuard, ());
     let client = EmergencyGuardClient::new(env, &contract_id);
     let admins_vec = {

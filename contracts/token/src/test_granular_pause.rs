@@ -1,13 +1,11 @@
-#![cfg(test)]
-
 //! Granular pausing tests for MINT, BURN, and TRANSFER operations.
 //!
 //! These tests verify that pausing specific operations via EmergencyGuard
 //! works independently — pausing MINT does not affect BURN or TRANSFER,
 //! and vice versa.
 
-use soroban_sdk::{testutils::Address as _, vec, Address, Env};
 use emergency_guard::{EmergencyGuard, EmergencyGuardClient, PauseType};
+use soroban_sdk::{testutils::Address as _, vec, Address, Env};
 
 fn setup_guard<'a>(env: &'a Env, admin: &'a Address) -> EmergencyGuardClient<'a> {
     let contract_id = env.register(EmergencyGuard, ());

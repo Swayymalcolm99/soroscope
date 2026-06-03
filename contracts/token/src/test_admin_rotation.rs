@@ -1,9 +1,8 @@
-#![cfg(test)]
-
 use crate::contract::{Token, TokenClient};
 use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
-fn setup(env: &Env) -> (TokenClient, Address) {
+#[cfg(test)]
+fn setup(env: &Env) -> (TokenClient<'_>, Address) {
     let contract_id = env.register(Token, ());
     let client = TokenClient::new(env, &contract_id);
     let admin = Address::generate(env);

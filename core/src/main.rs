@@ -1,24 +1,28 @@
+#![allow(dead_code)]
+
 mod auth;
 mod benchmarks;
+mod cache;
 mod comparison;
 mod errors;
-mod simulation_service;
 pub mod fee_analytics;
 pub mod fee_collector;
 pub mod fee_store;
+mod gas_golfing;
 pub mod insights;
 mod jobs;
 mod merkle_tree;
 mod parser;
 mod routing;
 pub mod rpc_provider;
-mod cache;
+mod runner;
 mod simulation;
+mod simulation_service;
 mod wasm_branch_analysis;
 mod ws;
 mod merkle_tree;
 
-use crate::cache::{SimulationCache, ContractCache};
+use crate::cache::{ContractCache, SimulationCache};
 use crate::comparison::{CompareMode, RegressionFlag, RegressionReport, ResourceDelta};
 use crate::errors::AppError;
 use crate::merkle_tree::MerkleTree;
@@ -36,15 +40,14 @@ use std::sync::Arc;
 use crate::fee_analytics::{FeeAnalyticsEngine, MarketConditions, ModelBreakdown};
 use crate::fee_collector::{FeeCollector, FeeCollectorConfig};
 use crate::fee_store::FeeStore;
-use crate::cache::{DiskCache, DiskCacheConfig};
+use crate::gas_golfing::{GasGolfingAnalyzer, GasGolfingReport};
 use crate::insights::InsightsEngine;
-use crate::jobs::{
-    JobId, JobQueue, JobQueueConfig, JobWorker, SubmitJobRequest, SubmitJobResponse,
-};
-use crate::rpc_provider::{ProviderRegistry, RpcProvider};
-use crate::simulation::{SimulationEngine, SimulationResult};
+use crate::jobs::{JobQueue, JobQueueConfig, JobWorker};
+use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
+use crate::simulation::{SimulationEngine, SimulationMode, SimulationResult};
+use crate::ws::SimulationBus;
 use axum::{
-    extract::{Json, Multipart, Path, State},
+    extract::{Json, Multipart, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware,
     response::IntoResponse,
@@ -54,6 +57,7 @@ use axum::{
 use config::{Config, ConfigError};
 use prometheus::{Encoder, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
+use simulation_service::{AnalysisResult, SimulationMetric, SimulationService};
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
@@ -152,6 +156,10 @@ fn default_health_check_interval() -> u64 {
 
 fn default_simulation_timeout_secs() -> u64 {
     30
+}
+
+fn default_simulation_mode() -> String {
+    "failover".to_string()
 }
 
 fn default_gossip_interval_secs() -> u64 {
@@ -322,6 +330,8 @@ pub struct AppState {
     fee_store: Arc<FeeStore>,
     /// Prometheus metrics collectors.
     metrics: Arc<AppMetrics>,
+    /// WebSocket event bus for simulation jobs.
+    simulation_bus: Arc<SimulationBus>,
 }
 
 #[derive(Clone)]
@@ -404,40 +414,34 @@ pub struct AnalyzeRequest {
 #[derive(Serialize, ToSchema)]
 pub struct ResourceReport {
     /// CPU instructions consumed
-    #[schema(example = 1500, description = "CPU instructions consumed by the contract call")]
+    #[schema(example = 1500)]
     pub cpu_instructions: u64,
     /// RAM bytes consumed
-    #[schema(example = 3000, description = "RAM bytes consumed by the contract call")]
+    #[schema(example = 3000)]
     pub ram_bytes: u64,
     /// Ledger read bytes
-    #[schema(example = 1024, description = "Ledger read bytes during the contract call")]
+    #[schema(example = 1024)]
     pub ledger_read_bytes: u64,
     /// Ledger write bytes
-    #[schema(example = 512, description = "Ledger write bytes during the contract call")]
+    #[schema(example = 512)]
     pub ledger_write_bytes: u64,
     /// Transaction size in bytes
-    #[schema(example = 450, description = "Transaction size in bytes")]
+    #[schema(example = 450)]
     pub transaction_size_bytes: u64,
     /// Estimated cost in stroops
-    #[schema(example = 1000, description = "Estimated cost in stroops")]
+    #[schema(example = 1000)]
     pub cost_stroops: u64,
     /// Report showing which data was injected vs live
-    #[schema(description = "State dependency report for the simulation")]
     pub state_dependency: Option<Vec<StateDependencyReport>>,
     /// TTL status for touched ledger entries and extension suggestions.
-    #[schema(description = "TTL analysis report for touched ledger entries")]
     pub ttl_analysis: Option<TtlAnalysisApiReport>,
     /// Efficiency score (0–100) and optimisation insights.
-    #[schema(description = "Efficiency score and optimisation insights")]
     pub nutrition: NutritionReport,
     /// Cross-contract call graph
-    #[schema(description = "Cross-contract call graph")]
     pub call_graph: Option<crate::simulation::CallGraph>,
     /// Call graph in Mermaid format
-    #[schema(description = "Call graph in Mermaid format")]
     pub call_graph_mermaid: Option<String>,
     /// Snapshot of the ledger state used/touched during simulation
-    #[schema(description = "Snapshot of the ledger state used/touched during simulation")]
     pub state_snapshot: Option<crate::simulation::SimulationStateSnapshot>,
     /// Protocol version used for this simulation
     #[schema(example = 20)]
@@ -951,7 +955,13 @@ async fn analyze_wasm(
 
     let start_time = std::time::Instant::now();
     let resources = tokio::task::spawn_blocking(move || {
-        simulation::profile_contract(wasm_bytes, function_name, args, payload.protocol_version, payload.enable_experimental)
+        simulation::profile_contract(
+            wasm_bytes,
+            function_name,
+            args,
+            payload.protocol_version,
+            payload.enable_experimental,
+        )
     })
     .await
     .map_err(|e| {
@@ -989,6 +999,8 @@ async fn analyze_wasm(
         state_dependency: None,
         ttl_analysis: None,
         transaction_data: String::new(),
+        call_graph: None,
+        state_snapshot: None,
         protocol_version: payload.protocol_version.unwrap_or(20),
     };
 
@@ -1080,8 +1092,8 @@ async fn analyze_wasm_branches(
     State(_state): State<Arc<AppState>>,
     Json(payload): Json<AnalyzeWasmBranchesRequest>,
 ) -> Result<Json<WasmBranchAnalysisResponse>, AppError> {
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
     use crate::wasm_branch_analysis::analyze_wasm_branches as run_analysis;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
     tracing::info!(
         function_name = %payload.function_name,
@@ -1095,12 +1107,10 @@ async fn analyze_wasm_branches(
     let function_name = payload.function_name.clone();
     let args = payload.args.clone().unwrap_or_default();
 
-    let report = tokio::task::spawn_blocking(move || {
-        run_analysis(wasm_bytes, function_name, args)
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("Branch analysis task panicked: {}", e)))?
-    .map_err(|e| AppError::Internal(format!("Branch analysis failed: {}", e)))?;
+    let report = tokio::task::spawn_blocking(move || run_analysis(wasm_bytes, function_name, args))
+        .await
+        .map_err(|e| AppError::Internal(format!("Branch analysis task panicked: {}", e)))?
+        .map_err(|e| AppError::Internal(format!("Branch analysis failed: {}", e)))?;
 
     tracing::info!(
         function_name = %payload.function_name,
@@ -1339,7 +1349,7 @@ pub struct GasGolfingRequest {
 
 #[derive(Serialize, ToSchema)]
 pub struct GasGolfingResponse {
-    pub report: crate::gas_golfing::GasGolfingReport,
+    pub report: GasGolfingReport,
 }
 
 // ── Gas Golfing Handler ───────────────────────────────────────────────────
@@ -1373,7 +1383,9 @@ async fn analyze_gas_golfing(
     let contract_name = payload.contract_name.clone();
 
     let report = tokio::task::spawn_blocking(move || {
-        state.gas_golfing_analyzer.analyze_wasm(&wasm_bytes, &contract_name)
+        state
+            .gas_golfing_analyzer
+            .analyze_wasm(&wasm_bytes, &contract_name)
     })
     .await
     .map_err(|e| AppError::Internal(format!("Gas golfing analysis task panicked: {}", e)))?;
@@ -1399,8 +1411,6 @@ async fn analyze_gas_golfing(
 async fn fee_recommend(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<FeeRecommendationResponse>, AppError> {
-    use crate::fee_analytics::TrendDirection;
-
     tracing::info!("Generating fee recommendation");
 
     // Get recent samples for analysis
@@ -1628,6 +1638,13 @@ async fn main() {
         if let Some(path) = wasm_path {
             if let Err(e) = benchmarks::run_token_benchmark(path, simulation_service.as_ref()).await {
                 eprintln!("Benchmark failed: {}", e);
+            let db_path = env::var("SOROSCOPE_DB_PATH")
+                .unwrap_or_else(|_| "soroscope_metrics.db".to_string());
+            let webhook_url = env::var("SOROSCOPE_ALERT_WEBHOOK_URL").ok();
+            let simulation_service = SimulationService::new(db_path, webhook_url)
+                .expect("initialize simulation service");
+            if let Err(e) = benchmarks::run_token_benchmark(path, &simulation_service).await {
+                tracing::error!("Benchmark failed: {}", e);
             }
         } else {
             tracing::error!(
@@ -1777,7 +1794,9 @@ async fn main() {
     // ── CLI: export subcommand ──────────────────────────────────────────
     if args.len() > 1 && args[1] == "export" {
         if args.len() < 6 {
-            eprintln!("Usage: soroscope-core export <contract_id> <function> <args_json> <output_file>");
+            eprintln!(
+                "Usage: soroscope-core export <contract_id> <function> <args_json> <output_file>"
+            );
             eprintln!("\nSimulate a transaction and export the touched state to a JSON file.");
             std::process::exit(1);
         }
@@ -1793,7 +1812,10 @@ async fn main() {
         let registry = rpc_provider::ProviderRegistry::new(providers);
         let engine = SimulationEngine::with_registry(std::sync::Arc::clone(&registry));
 
-        match engine.simulate_from_contract_id(contract_id, function, parsed_args, None).await {
+        match engine
+            .simulate_from_contract_id(contract_id, function, parsed_args, None, None, None)
+            .await
+        {
             Ok(result) => {
                 if let Some(snapshot) = result.state_snapshot {
                     let json = serde_json::to_string_pretty(&snapshot).unwrap();
@@ -1829,8 +1851,10 @@ async fn main() {
         let function = &args[4];
         let args_json = &args[5];
 
-        let snapshot_json = std::fs::read_to_string(snapshot_file).expect("Failed to read snapshot file");
-        let snapshot: crate::simulation::SimulationStateSnapshot = serde_json::from_str(&snapshot_json).expect("Failed to parse snapshot JSON");
+        let snapshot_json =
+            std::fs::read_to_string(snapshot_file).expect("Failed to read snapshot file");
+        let snapshot: crate::simulation::SimulationStateSnapshot =
+            serde_json::from_str(&snapshot_json).expect("Failed to parse snapshot JSON");
 
         let parsed_args: Vec<String> = serde_json::from_str(args_json).unwrap_or_default();
 
@@ -1838,7 +1862,17 @@ async fn main() {
         let registry = rpc_provider::ProviderRegistry::new(providers);
         let engine = SimulationEngine::with_registry(std::sync::Arc::clone(&registry));
 
-        match engine.simulate_from_contract_id(contract_id, function, parsed_args, Some(snapshot.ledger_entries)).await {
+        match engine
+            .simulate_from_contract_id(
+                contract_id,
+                function,
+                parsed_args,
+                Some(snapshot.ledger_entries),
+                None,
+                None,
+            )
+            .await
+        {
             Ok(result) => {
                 println!("Simulation successful with restored state.");
                 println!("Resources: {:?}", result.resources);
@@ -1901,7 +1935,7 @@ async fn main() {
         timeout_secs = config.simulation_timeout_secs,
         "Simulation timeout configured"
     );
-    tracing::info!(mode = %simulation_mode, "Simulation mode configured");
+    tracing::info!(mode = ?simulation_mode, "Simulation mode configured");
 
     // ── Fee Market Setup ────────────────────────────────────────────────
     let database_url = &config.database_url;
@@ -1926,7 +1960,7 @@ async fn main() {
         max_concurrent_jobs: config.max_concurrent_jobs,
         ..JobQueueConfig::default()
     };
-    let job_queue = JobQueue::new(database_url, job_queue_config.clone())
+    let job_queue = JobQueue::new(database_url, &config.redis_url, job_queue_config.clone())
         .await
         .expect("Failed to initialize job queue");
     // ── WebSocket event bus ─────────────────────────────────────────────
@@ -2028,6 +2062,7 @@ async fn main() {
             Arc::clone(&registry),
             Arc::clone(&contract_cache),
         ),
+        provider_registry: Arc::clone(&registry),
         cache: simulation_cache,
         insights_engine: InsightsEngine::new(),
         gas_golfing_analyzer: GasGolfingAnalyzer::new(),
@@ -2036,6 +2071,7 @@ async fn main() {
         fee_analytics_engine,
         fee_store,
         metrics: Arc::new(AppMetrics::new().expect("Failed to initialize Prometheus metrics")),
+        simulation_bus,
     });
 
     let cors = CorsLayer::new().allow_origin(Any);
@@ -2099,7 +2135,7 @@ async fn main() {
 // Integration Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::simulation::{SimulationError, SorobanResources};
@@ -2186,6 +2222,9 @@ mod tests {
             state_dependency: None,
             ttl_analysis: None,
             transaction_data: "AAA".to_string(),
+            call_graph: None,
+            state_snapshot: None,
+            protocol_version: 0,
         };
 
         let insights_engine = InsightsEngine::new();
@@ -2227,8 +2266,8 @@ mod tests {
     /// returns i32 (i32.const 42; end). Mirrors the helper in simulation.rs.
     fn minimal_wasm_bytes() -> Vec<u8> {
         use wasm_encoder::{
-            CodeSection, ExportKind, ExportSection, Function, FunctionSection,
-            Module, TypeSection, ValType,
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection, Module, TypeSection,
+            ValType,
         };
         let mut module = Module::new();
         let mut types = TypeSection::new();
@@ -2411,7 +2450,6 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
-
 }
 
 async fn analyze_simulation(

@@ -480,7 +480,6 @@ fn guard_init(e: &Env, admin: Address) {
     let admins = vec![e, admin];
     e.storage().instance().set(&DataKey::GuardAdmins, &admins);
     e.storage().instance().set(&DataKey::GuardThreshold, &1u32);
-    e.storage().instance().set(&DataKey::GuardPauseState, &0u32);
 }
 
 fn guard_pause_state(e: &Env) -> u32 {
@@ -542,6 +541,7 @@ fn guard_require_multisig(e: &Env, approvers: &Vec<Address>) -> Result<(), Error
         .instance()
         .get(&DataKey::GuardThreshold)
         .ok_or(Error::NotInitialized)?;
+    let admins = guard_admins(e);
 
     let mut valid = 0u32;
 fn primary_admin(e: &Env) -> Result<Address, GuardError> {
@@ -572,7 +572,7 @@ fn check_multi_sig(e: &Env, approvers: &Vec<Address>) -> Result<(), GuardError> 
             continue;
         }
         seen.push_back(addr.clone());
-        if guard_is_admin(e, &addr) {
+        if admins.iter().any(|a| a == addr) {
             addr.require_auth();
             valid += 1;
         }
@@ -585,15 +585,11 @@ fn check_multi_sig(e: &Env, approvers: &Vec<Address>) -> Result<(), GuardError> 
 }
 
 fn guard_set_ops(e: &Env, ops: u32, paused: bool) {
-    let mut state = guard_pause_state(e);
-    if paused {
-        state |= ops;
-    } else {
-        state &= !ops;
+    let state = guard_pause_state(e);
+    let next = if paused { state | ops } else { state & !ops };
+    if next != state {
+        e.storage().instance().set(&DataKey::GuardPauseState, &next);
     }
-    e.storage()
-        .instance()
-        .set(&DataKey::GuardPauseState, &state);
 }
 const CORE_PAUSE_OPS: [u32; 4] = [
     PauseType::SWAP,

@@ -2,14 +2,22 @@
 
 import React, { useCallback, useState } from 'react';
 import { useDropzone, FileRejection } from 'react-dropzone';
+import { parseWasmError, WasmBackendError } from '../lib/errorHandling';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type UploadState = 'idle' | 'hover' | 'scanning' | 'success' | 'error';
+type UploadState = 'idle' | 'hover' | 'scanning' | 'success' | 'error' | 'submitting';
 
 interface DroppedFile {
   name: string;
   sizeBytes: number;
+}
+
+interface ErrorDetails {
+  title: string;
+  message: string;
+  details?: string;
+  suggestedAction?: string;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -168,6 +176,10 @@ function ErrorIcon() {
 export interface UploadZoneProps {
   /** Called with the validated File once scanning completes */
   onFileReady?: (file: File) => void;
+  /** Backend endpoint for WASM analysis (default: http://localhost:8080/analyze/wasm) */
+  backendUrl?: string;
+  /** Whether to validate with backend after client-side checks */
+  enableBackendValidation?: boolean;
 }
 
 export function UploadZone({ onFileReady }: UploadZoneProps) {
@@ -178,14 +190,132 @@ export function UploadZone({ onFileReady, onReset }: UploadZoneProps) {
 }
 
 export function UploadZone({ onFileReady }: UploadZoneProps) {
+export function UploadZone({ 
+  onFileReady, 
+  backendUrl = 'http://localhost:8080/analyze/wasm',
+  enableBackendValidation = true 
+}: UploadZoneProps) {
   const [uploadState, setUploadState] = useState<UploadState>('idle');
   const [droppedFile, setDroppedFile] = useState<DroppedFile | null>(null);
   const [errorMessage, setErrorMessage] = useState<string>('');
+  const [errorDetails, setErrorDetails] = useState<ErrorDetails | null>(null);
   const [unexpectedError, setUnexpectedError] = useState<Error | null>(null);
 
   if (unexpectedError) {
     throw unexpectedError;
   }
+
+  // ── Backend submission ───────────────────────────────────────────────────────
+
+  const submitToBackend = async (file: File): Promise<boolean> => {
+    try {
+      setUploadState('submitting');
+      const reader = new FileReader();
+      
+      return new Promise((resolve) => {
+        reader.onload = async (event) => {
+          try {
+            const arrayBuffer = event.target?.result as ArrayBuffer;
+            if (!arrayBuffer) throw new Error('Failed to read file');
+
+            // Convert to base64 for backend submission
+            const bytes = new Uint8Array(arrayBuffer);
+            let binary = '';
+            for (let i = 0; i < bytes.byteLength; i++) {
+              binary += String.fromCharCode(bytes[i]);
+            }
+            const base64Data = btoa(binary);
+
+            const response = await fetch(backendUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                wasm_bytes: base64Data,
+                function_name: 'main', // Default function for validation
+                args: [],
+              }),
+            });
+
+            if (!response.ok) {
+              const errorText = await response.text();
+              let errorMessage = errorText;
+              
+              // Try to parse as JSON for better error details
+              try {
+                const errorJson = JSON.parse(errorText);
+                errorMessage = errorJson.message || errorJson.error || errorText;
+              } catch (e) {
+                // Use raw error text
+              }
+
+              const wasmError = parseWasmError(response, errorMessage);
+              setErrorMessage(wasmError.message);
+              setErrorDetails(wasmError);
+              setUploadState('error');
+              setDroppedFile(null);
+              resolve(false);
+              return;
+            }
+
+            // Backend accepted the WASM file
+            setUploadState('success');
+            onFileReady?.(file);
+            resolve(true);
+          } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : 'Failed to validate with backend';
+            setErrorMessage(errorMsg);
+            setErrorDetails({
+              title: 'Validation Error',
+              message: errorMsg,
+              suggestedAction: 'Please try uploading again.',
+            });
+            setUploadState('error');
+            setDroppedFile(null);
+            resolve(false);
+          }
+        };
+
+        reader.onerror = () => {
+          const errorMsg = reader.error?.message ?? 'Unable to read the selected file';
+          setErrorMessage(errorMsg);
+          setErrorDetails({
+            title: 'File Read Error',
+            message: errorMsg,
+            suggestedAction: 'Please try selecting the file again.',
+          });
+          setUploadState('error');
+          setDroppedFile(null);
+          resolve(false);
+        };
+
+        try {
+          reader.readAsArrayBuffer(file);
+        } catch (error) {
+          const errorMsg = error instanceof Error ? error.message : 'Unable to start reading file';
+          setErrorMessage(errorMsg);
+          setErrorDetails({
+            title: 'File Read Error',
+            message: errorMsg,
+            suggestedAction: 'Please try selecting a different file.',
+          });
+          setUploadState('error');
+          setDroppedFile(null);
+          resolve(false);
+        }
+      });
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'An unexpected error occurred';
+      setErrorMessage(errorMsg);
+      setErrorDetails({
+        title: 'Submission Error',
+        message: errorMsg,
+        suggestedAction: 'Please try again.',
+      });
+      setUploadState('error');
+      setDroppedFile(null);
+      return false;
+    }
+  };
 
   // ── Drop handling ────────────────────────────────────────────────────────────
 
@@ -195,11 +325,12 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
       setDroppedFile({ name: file.name, sizeBytes: file.size });
       setUploadState('scanning');
       setErrorMessage('');
+      setErrorDetails(null);
 
       // Simulate async scan (replace with real WASM parsing logic)
       const reader = new FileReader();
       reader.onload = (event) => {
-        setTimeout(() => {
+        setTimeout(async () => {
           try {
             const arrayBuffer = event.target?.result as ArrayBuffer;
             if (!arrayBuffer) throw new Error('Failed to read file content');
@@ -220,10 +351,22 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
               throw new Error(`Unsupported WASM version: ${version}. Expected version 1`);
             }
 
-            setUploadState('success');
-            onFileReady?.(file);
+            // Client-side validation passed, now validate with backend if enabled
+            if (enableBackendValidation) {
+              await submitToBackend(file);
+            } else {
+              // Skip backend validation
+              setUploadState('success');
+              onFileReady?.(file);
+            }
           } catch (error) {
-            setErrorMessage(error instanceof Error ? error.message : 'Failed to parse WASM metadata');
+            const errorMsg = error instanceof Error ? error.message : 'Failed to parse WASM metadata';
+            setErrorMessage(errorMsg);
+            setErrorDetails({
+              title: 'Invalid WASM File',
+              message: errorMsg,
+              suggestedAction: 'Please ensure you\'re uploading a valid compiled Soroban contract.',
+            });
             setUploadState('error');
             setDroppedFile(null);
           }
@@ -231,7 +374,13 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
       };
       
       reader.onerror = () => {
-        setErrorMessage(reader.error?.message ?? 'Unable to read the selected file');
+        const errorMsg = reader.error?.message ?? 'Unable to read the selected file';
+        setErrorMessage(errorMsg);
+        setErrorDetails({
+          title: 'File Read Error',
+          message: errorMsg,
+          suggestedAction: 'Please try selecting the file again.',
+        });
         setUploadState('error');
         setDroppedFile(null);
       };
@@ -239,12 +388,18 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
       try {
         reader.readAsArrayBuffer(file);
       } catch (error) {
-        setErrorMessage(error instanceof Error ? error.message : 'Unable to start reading the selected file');
+        const errorMsg = error instanceof Error ? error.message : 'Unable to start reading the selected file';
+        setErrorMessage(errorMsg);
+        setErrorDetails({
+          title: 'File Read Error',
+          message: errorMsg,
+          suggestedAction: 'Please try selecting a different file.',
+        });
         setUploadState('error');
         setDroppedFile(null);
       }
     },
-    [onFileReady]
+    [onFileReady, enableBackendValidation, submitToBackend]
   );
 
   const onDropRejected = useCallback((rejections: FileRejection[]) => {
@@ -257,6 +412,13 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
     setErrorMessage(
       `"${fileName}" was rejected — only .wasm files are accepted (got ${ext})`
     );
+    const errorMsg = `"${fileName}" was rejected — only .wasm files are accepted (got ${ext})`;
+    setErrorMessage(errorMsg);
+    setErrorDetails({
+      title: 'Invalid File Type',
+      message: errorMsg,
+      suggestedAction: 'Please upload a compiled .wasm file.',
+    });
     setUploadState('error');
     setDroppedFile(null);
   }, []);
@@ -728,7 +890,7 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
   }, []);
 
   const onDragEnter = useCallback(() => {
-    if (uploadState !== 'scanning') setUploadState('hover');
+    if (uploadState !== 'scanning' && uploadState !== 'submitting') setUploadState('hover');
   }, [uploadState]);
 
   const onDragLeave = useCallback(() => {
@@ -747,6 +909,8 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
     maxSize: MAX_WASM_SIZE,
     noClick: uploadState === 'scanning',
     noDrag: uploadState === 'scanning',
+    noClick: uploadState === 'scanning' || uploadState === 'submitting',
+    noDrag: uploadState === 'scanning' || uploadState === 'submitting',
   });
 
   // ── Reset ────────────────────────────────────────────────────────────────────
@@ -756,6 +920,8 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
     setUploadState('idle');
     setDroppedFile(null);
     setErrorMessage('');
+    setErrorDetails(null);
+    setUnexpectedError(null);
   };
 
   // ── Dynamic border & bg classes ──────────────────────────────────────────────
@@ -764,6 +930,7 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
     idle: 'border-slate-600 hover:border-slate-400',
     hover: 'border-sky-400 shadow-[0_0_24px_rgba(56,189,248,0.2)]',
     scanning: 'border-violet-500 shadow-[0_0_24px_rgba(167,139,250,0.25)]',
+    submitting: 'border-violet-500 shadow-[0_0_24px_rgba(167,139,250,0.25)]',
     success: 'border-emerald-500 shadow-[0_0_24px_rgba(52,211,153,0.2)]',
     error: 'border-red-500 shadow-[0_0_24px_rgba(248,113,113,0.2)]',
   }[uploadState];
@@ -772,6 +939,7 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
     idle: 'bg-slate-900/60 hover:bg-slate-800/60',
     hover: 'bg-sky-950/50',
     scanning: 'bg-violet-950/40',
+    submitting: 'bg-violet-950/40',
     success: 'bg-emerald-950/40',
     error: 'bg-red-950/30',
   }[uploadState];
@@ -864,6 +1032,27 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
           </div>
         )}
 
+        {/* ── SUBMITTING STATE ── */}
+        {uploadState === 'submitting' && (
+          <div className="flex flex-col items-center text-center gap-3 w-full px-4">
+            <WasmIcon state="scanning" />
+            <p className="text-violet-300 font-semibold text-base tracking-wide">
+              Validating with server…
+            </p>
+            {droppedFile && (
+              <div className="flex items-center gap-2 text-xs text-slate-400 font-mono bg-slate-800/70 px-3 py-1.5 rounded-full border border-slate-700">
+                <span className="text-violet-400">📄</span>
+                <span className="truncate max-w-[240px]">{droppedFile.name}</span>
+                <span className="text-slate-500">·</span>
+                <span>{formatBytes(droppedFile.sizeBytes)}</span>
+              </div>
+            )}
+            <ScanningAnimation />
+            <SpinnerDots />
+            <p className="text-xs text-slate-500">Sending to backend for validation…</p>
+          </div>
+        )}
+
         {/* ── SUCCESS STATE ── */}
         {uploadState === 'success' && droppedFile && (
           <div className="flex flex-col items-center text-center gap-4">
@@ -909,12 +1098,27 @@ export function UploadZone({ onFileReady }: UploadZoneProps) {
             <div>
               <p className="text-red-400 font-semibold text-base">
                 <ErrorIcon />
-                File rejected
+                {errorDetails?.title || 'File rejected'}
               </p>
-              <p className="text-xs text-red-300/70 mt-1 max-w-[280px] leading-relaxed">
-                {errorMessage}
+              <p className="text-xs text-red-300/70 mt-2 max-w-[320px] leading-relaxed">
+                {errorDetails?.message || errorMessage}
               </p>
+              {errorDetails?.details && (
+                <div className="mt-3 max-w-[320px] text-left p-3 rounded-lg bg-red-950/40 border border-red-800/30">
+                  <p className="text-xs text-red-200/80 leading-relaxed font-mono">
+                    {errorDetails.details}
+                  </p>
+                </div>
+              )}
             </div>
+
+            {errorDetails?.suggestedAction && (
+              <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-amber-950/40 border border-amber-800/30 max-w-[320px]">
+                <span className="text-xs text-amber-200/80 leading-relaxed">
+                  💡 {errorDetails.suggestedAction}
+                </span>
+              </div>
+            )}
 
             <div className="flex items-center gap-2 px-4 py-1.5 rounded-full bg-red-950/40 border border-red-800/50">
               <span className="w-2 h-2 rounded-full bg-red-400" />

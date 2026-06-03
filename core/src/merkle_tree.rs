@@ -1,13 +1,54 @@
 use sha2::{Digest, Sha256};
 
+/// Which side of the current node a proof sibling belongs on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProofDirection {
+    Left,
+    Right,
+}
+
+/// A single sibling hash in a Merkle proof path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MerkleProofStep {
+    pub direction: ProofDirection,
+    pub hash: [u8; 32],
+}
+
+/// A Merkle inclusion proof for one leaf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MerkleProof {
+    pub leaf_index: usize,
+    pub leaf_hash: [u8; 32],
+    pub root: [u8; 32],
+    pub steps: Vec<MerkleProofStep>,
+}
+
+impl MerkleProof {
+    /// Verifies this proof against the stored root.
+    pub fn verify(&self) -> bool {
+        let mut current = self.leaf_hash;
+
+        for step in &self.steps {
+            current = match step.direction {
+                ProofDirection::Left => MerkleTree::hash_pair(&step.hash, &current),
+                ProofDirection::Right => MerkleTree::hash_pair(&current, &step.hash),
+            };
+        }
+
+        current == self.root
+    }
+}
+
 /// Represents a Merkle Tree for storing cryptographic state commitments.
 pub struct MerkleTree {
     /// The root hash of the tree.
     pub root: [u8; 32],
-    /// The level of the tree (max 32 levels).
+    /// The maximum supported tree depth.
     pub levels: usize,
     /// The current leaf nodes/data inputs.
     data_leaves: Vec<Vec<u8>>,
+    /// Cached hashed levels. Index 0 contains leaf hashes, the last index contains the root.
+    hashed_levels: Vec<Vec<[u8; 32]>>,
 }
 
 impl MerkleTree {
@@ -15,139 +56,189 @@ impl MerkleTree {
     pub fn new(levels: usize) -> Self {
         MerkleTree {
             root: [0u8; 32],
-            levels: levels,
+            levels,
             data_leaves: Vec::new(),
+            hashed_levels: Vec::new(),
         }
     }
 
     /// Builds the Merkle Tree from a provided set of data blocks.
-    /// This implementation should handle an efficient, incremental update math.
     pub fn build(&mut self, leaves: Vec<Vec<u8>>) -> Result<(), &'static str> {
         if leaves.is_empty() {
             return Err("Cannot build tree from empty leaves.");
         }
-        
-        // TODO: Implement the actual construction logic here.
-        // This involves iteratively hashing adjacent leaf pairs up to the root level.
-        
+
+        let leaf_capacity = 1usize
+            .checked_shl(self.levels as u32)
+            .ok_or("Tree levels exceed supported usize capacity.")?;
+
+        if leaves.len() > leaf_capacity {
+            return Err("Leaf count exceeds configured tree capacity.");
+        }
+
+        let hashed_levels = Self::calculate_levels(&leaves);
+        let root = hashed_levels
+            .last()
+            .and_then(|level| level.first())
+            .copied()
+            .ok_or("Cannot calculate a root for empty levels.")?;
+
+        self.root = root;
         self.data_leaves = leaves;
-        // A placeholder for the root hash calculation
-        self.root.copy_from_slice(&Self::calculate_root_hash(leaves));
+        self.hashed_levels = hashed_levels;
+
         Ok(())
     }
 
-        if current_level.len() == 1 {
-            return current_level[0].clone();
+    /// Generates an inclusion proof for the leaf at `leaf_index`.
+    pub fn generate_proof(&self, leaf_index: usize) -> Result<MerkleProof, &'static str> {
+        if self.hashed_levels.is_empty() {
+            return Err("Cannot generate proof before building the tree.");
         }
 
-        let mut next_level: Vec<Vec<u8>> = Vec::new();
-        // Iterate over the levels, processing pairs in groups of 2
-        let num_pairs = current_level.len() / 2;
-        
-        for i in 0..num_pairs {
-            let left = &current_level[i];
-            let right = &current_level[i + 1];
-            
-            // Concatenate the hashes and rehash
-            let mut combined = Vec::new();
-            combined.extend_from_slice(left);
-            combined.extend_from_slice(right);
-
-            let mut hasher = Sha256::new();
-            hasher.update(combined);
-            next_level.push(hasher.finalize().to_vec());
+        if leaf_index >= self.data_leaves.len() {
+            return Err("Leaf index is out of bounds.");
         }
 
-        // If the number of nodes was odd, the last node is hashed with itself (standard practice: hash(x || x))
-        if current_level.len() % 2 != 0 {
-            let last = &current_level[current_level.len() - 1];
-            let mut combined = Vec::new();
-            combined.extend_from_slice(last);
-            combined.extend_from_slice(last); // Hash with itself
-            
-            let mut hasher = Sha256::new();
-            hasher.update(combined);
-            next_level.push(hasher.finalize().to_vec());
-        }
-        
-        current_level = next_level;
-        
-        // Recursively find the root
-        Self::calculate_root_hash(current_level)
-    }
+        let mut proof_index = leaf_index;
+        let mut steps = Vec::new();
 
-    /// A helper function to perform the recursive root calculation.
-    fn calculate_root_hash(mut levels: Vec<Vec<u8>>) -> [u8; 32] {
-        while levels.len() > 1 {
-            let num_pairs = levels.len() / 2;
-            let mut next_level: Vec<Vec<u8>> = Vec::new();
-            
-            for i in 0..num_pairs {
-                let left = &levels[i];
-                let right = &levels[i + 1];
-                
-                let mut combined = Vec::new();
-                combined.extend_from_slice(left);
-                combined.extend_from_slice(right);
+        for level in self
+            .hashed_levels
+            .iter()
+            .take(self.hashed_levels.len().saturating_sub(1))
+        {
+            let is_right_node = proof_index % 2 == 1;
+            let sibling_index = if is_right_node {
+                proof_index - 1
+            } else {
+                proof_index + 1
+            };
 
-                let mut hasher = Sha256::new();
-                hasher.update(combined);
-                next_level.push(hasher.finalize().to_vec());
-            }
+            let sibling_hash = level
+                .get(sibling_index)
+                .copied()
+                .unwrap_or_else(|| level[proof_index]);
 
-            if levels.len() % 2 != 0 {
-                let last = &levels[levels.len() - 1];
-                let mut combined = Vec::new();
-                combined.extend_from_slice(last);
-                combined.extend_from_slice(last);
-                
-                let mut hasher = Sha256::new();
-                hasher.update(combined);
-                next_level.push(hasher.finalize().to_vec());
-            }
-            
-            levels = next_level;
+            steps.push(MerkleProofStep {
+                direction: if is_right_node {
+                    ProofDirection::Left
+                } else {
+                    ProofDirection::Right
+                },
+                hash: sibling_hash,
+            });
+
+            proof_index /= 2;
         }
-        
-        // Return the final hash (the root)
-        let mut root_bytes = [0u8; 32];
-        if let Some(root) = levels.get(0) {
-            root_bytes.copy_from_slice(root);
-        }
-        root_bytes
-    }
-            current_level = next_level;
-        }
-        
-        // Return the final hash (the root)
-        let mut root_bytes = [0u8; 32];
-        root_bytes.copy_from_slice(&current_level[0]);
-        root_bytes
+
+        Ok(MerkleProof {
+            leaf_index,
+            leaf_hash: self.hashed_levels[0][leaf_index],
+            root: self.root,
+            steps,
+        })
     }
 
     /// Gets the root hash as a hex string for easy use in transactions/commitments.
     pub fn get_root_hex(&self) -> String {
-        hex::encode(self.root.to_vec())
+        hex::encode(self.root)
+    }
+
+    fn calculate_levels(leaves: &[Vec<u8>]) -> Vec<Vec<[u8; 32]>> {
+        let mut levels = vec![leaves
+            .iter()
+            .map(|leaf| Self::hash_leaf(leaf))
+            .collect::<Vec<_>>()];
+
+        while levels.last().map_or(0, Vec::len) > 1 {
+            let current_level = levels.last().expect("level exists");
+            let mut next_level = Vec::new();
+
+            for pair in current_level.chunks(2) {
+                let left = pair[0];
+                let right = pair.get(1).copied().unwrap_or(left);
+                next_level.push(Self::hash_pair(&left, &right));
+            }
+
+            levels.push(next_level);
+        }
+
+        levels
+    }
+
+    fn hash_leaf(data: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hasher.finalize().into()
+    }
+
+    fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(left);
+        hasher.update(right);
+        hasher.finalize().into()
     }
 }
 
-// Minimal implementation required for compilation/testing purposes.
-// Note: Full usage requires adding 'hex' and 'sha2' to Cargo.toml
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_merkle_tree_basic_commit() {
-        let mut tree = MerkleTree::new(32);
-        
-        // Example data leaves
-        let data = vec![b"data1".to_vec(), b"data2".to_vec(), b"data3".to_vec()];
-        
-        // Since the calculate_root_hash is hardcoded and not fully tested, 
-        // we just check if it runs without panicking.
-        let result = tree.build(data.clone());
-        assert!(result.is_ok());
-        // In a full implementation, we would assert the correct root hash.
+    fn builds_tree_and_generates_valid_proofs_for_each_leaf() {
+        let mut tree = MerkleTree::new(3);
+        let leaves = vec![
+            b"cpu-budget".to_vec(),
+            b"read-bytes".to_vec(),
+            b"write-bytes".to_vec(),
+            b"events".to_vec(),
+            b"ledger-footprint".to_vec(),
+        ];
+
+        tree.build(leaves).expect("tree builds");
+
+        for index in 0..5 {
+            let proof = tree.generate_proof(index).expect("proof exists");
+            assert_eq!(proof.leaf_index, index);
+            assert_eq!(proof.root, tree.root);
+            assert!(proof.verify());
+        }
+    }
+
+    #[test]
+    fn proof_verification_rejects_tampered_leaf_hash() {
+        let mut tree = MerkleTree::new(2);
+        tree.build(vec![b"left".to_vec(), b"right".to_vec()])
+            .expect("tree builds");
+
+        let mut proof = tree.generate_proof(0).expect("proof exists");
+        proof.leaf_hash[0] ^= 0xff;
+
+        assert!(!proof.verify());
+    }
+
+    #[test]
+    fn single_leaf_proof_has_no_sibling_steps() {
+        let mut tree = MerkleTree::new(1);
+        tree.build(vec![b"only-leaf".to_vec()])
+            .expect("tree builds");
+
+        let proof = tree.generate_proof(0).expect("proof exists");
+
+        assert!(proof.steps.is_empty());
+        assert!(proof.verify());
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_proof_requests() {
+        let mut tree = MerkleTree::new(2);
+        tree.build(vec![b"left".to_vec(), b"right".to_vec()])
+            .expect("tree builds");
+
+        assert_eq!(
+            tree.generate_proof(2).expect_err("index should fail"),
+            "Leaf index is out of bounds."
+        );
     }
 }

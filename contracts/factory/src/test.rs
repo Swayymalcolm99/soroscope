@@ -9,6 +9,7 @@ use soroban_sdk::{
 };
 use std::vec::Vec;
 use soroban_sdk::{testutils::Address as _, vec, Address, BytesN, Env};
+use soroban_sdk::{testutils::Address as _, Env, Vec};
 
 fn dummy_pool_hash(env: &Env) -> BytesN<32> {
     BytesN::from_array(env, &[0; 32])
@@ -155,7 +156,9 @@ fn test_pool_creation() {
     // mapping in the Rust test space. Any `Address` representing the new pool will evaluate
     // to the `factory_id` in Rust. However, the host engine state is correct.
     // Therefore, we only assert that a value is returned and stored, bypassing strict equality.
-    let _pool_address = factory_client.create_pair(&token_a, &token_b, &pool_hash);
+    let _pool_address = factory_client
+        .create_pair(&token_a, &token_b, &pool_hash)
+        .unwrap();
 
     // Verify the pair is stored and retrievable
     let stored_pair = factory_client.get_pair(&token_a, &token_b);
@@ -167,8 +170,40 @@ fn test_pool_creation() {
 }
 
 #[test]
-#[should_panic(expected = "Pair already exists")]
-fn test_duplicate_pair_panics() {
+fn test_pause_create_pair() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory_id = env.register(LiquidityPoolFactory, ());
+    let factory_client = LiquidityPoolFactoryClient::new(&env, &factory_id);
+
+    let admin = Address::generate(&env);
+    let token_a = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let pool_hash = env
+        .deployer()
+        .upload_contract_wasm(liquidity_pool_contract::WASM);
+
+    let mut admins = Vec::new(&env);
+    admins.push_back(admin.clone());
+    factory_client.initialize(&admins, &1).unwrap();
+    factory_client.set_paused(&admin, &true).unwrap();
+
+    let result = factory_client.create_pair(&token_a, &token_b, &pool_hash);
+    assert_eq!(result, Err(Error::Paused));
+
+    factory_client.set_paused(&admin, &false).unwrap();
+    let created = factory_client.create_pair(&token_a, &token_b, &pool_hash).unwrap();
+    assert!(created != factory_id);
+}
+
+#[test]
+fn test_duplicate_pair_errors() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -186,10 +221,13 @@ fn test_duplicate_pair_panics() {
     let pool_hash = dummy_pool_hash(&env);
 
     // First creation succeeds
-    factory_client.create_pair(&token_a, &token_b, &pool_hash);
+    factory_client
+        .create_pair(&token_a, &token_b, &pool_hash)
+        .unwrap();
 
-    // Second creation with the same pair should panic
-    factory_client.create_pair(&token_a, &token_b, &pool_hash);
+    // Second creation with the same pair should return a pair-exists error
+    let result = factory_client.create_pair(&token_a, &token_b, &pool_hash);
+    assert_eq!(result, Err(Error::PairAlreadyExists));
 }
 /*
 // TODO: Enable this once we have a way to import the Liquidity Pool WASM

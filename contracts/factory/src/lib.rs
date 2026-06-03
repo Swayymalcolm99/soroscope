@@ -6,6 +6,9 @@ use soroban_sdk::{
 use emergency_guard::{EmergencyGuard, GuardError};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec,
+use emergency_guard::{EmergencyGuard, GuardError};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, IntoVal,
 };
 #[cfg(not(test))]
 use soroban_sdk::xdr::ToXdr;
@@ -23,6 +26,8 @@ pub enum Error {
     Unauthorized = 3,
     Paused = 4,
 }
+
+const PAUSE_CREATE_PAIR_FLAG: u32 = 1 << 6;
 
 /// Storage key for pair registry.
 /// Stored in **instance** storage because the factory is a singleton contract
@@ -62,8 +67,28 @@ fn check_not_paused(env: &Env, operation: u32) -> Result<(), Error> {
     }
 }
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    Paused = 4,
+    PairAlreadyExists = 5,
+    InvalidThreshold = 6,
+}
+
 #[contract]
 pub struct LiquidityPoolFactory;
+
+fn check_not_paused(env: &Env) -> Result<(), Error> {
+    if EmergencyGuard::is_paused(env.clone(), PAUSE_CREATE_PAIR_FLAG) {
+        Err(Error::Paused)
+    } else {
+        Ok(())
+    }
+}
 
 #[contractimpl]
 impl LiquidityPoolFactory {
@@ -130,6 +155,13 @@ impl LiquidityPoolFactory {
     /// Returns the raw factory pause bitmask.
     pub fn get_pause_state(env: Env) -> u32 {
         pause_state(&env)
+    /// Initialize the factory's emergency guard state with a set of admins.
+    pub fn initialize(env: Env, admins: soroban_sdk::Vec<Address>, threshold: u32) -> Result<(), Error> {
+        EmergencyGuard::initialize(env.clone(), admins, threshold).map_err(|e| match e {
+            GuardError::AlreadyInitialized => Error::AlreadyInitialized,
+            GuardError::InvalidThreshold => Error::InvalidThreshold,
+            _ => Error::Unauthorized,
+        })
     }
 
     /// Deploys a new Liquidity Pool contract for a unique pair of tokens.
@@ -142,6 +174,8 @@ impl LiquidityPoolFactory {
         if check_not_paused(&env, CREATE_PAIR).is_err() || EmergencyGuard::is_paused(env.clone(), PauseType::CREATE_PAIR) {
             panic!("Factory pair creation is paused");
         }
+    ) -> Result<Address, Error> {
+        check_not_paused(&env)?;
 
         let (token_0, token_1) = if token_a < token_b {
             (token_a, token_b)
@@ -155,7 +189,7 @@ impl LiquidityPoolFactory {
             .instance()
             .has(&DataKey::Pair(token_0.clone(), token_1.clone()))
         {
-            panic!("Pair already exists");
+            return Err(Error::PairAlreadyExists);
         }
 
         #[cfg(test)]
@@ -194,7 +228,7 @@ impl LiquidityPoolFactory {
         // One instance write instead of one persistent write.
         env.storage()
             .instance()
-            .set(&DataKey::Pair(token_0, token_1), &deployed_address);
+        Ok(deployed_address)y::Pair(token_0, token_1), &deployed_address);
 
         deployed_address
     }
@@ -263,6 +297,26 @@ impl LiquidityPoolFactory {
     /// Returns whether a factory operation is currently paused.
     pub fn is_guard_paused(env: Env, operation: u32) -> bool {
         EmergencyGuard::is_paused(env, operation)
+    /// Admin-only: pause or unpause pair creation.
+    pub fn set_paused(env: Env, admin: Address, paused: bool) -> Result<(), Error> {
+        EmergencyGuard::set_pause(env, admin, PAUSE_CREATE_PAIR_FLAG, paused).map_err(|e| match e {
+            GuardError::Unauthorized => Error::Unauthorized,
+            _ => Error::Unauthorized,
+        })
+    }
+
+    /// Admin-only: emergency pause all factory operations.
+    pub fn emergency_pause(env: Env, approvers: soroban_sdk::Vec<Address>) -> Result<(), Error> {
+        EmergencyGuard::emergency_pause(env, approvers).map_err(|e| match e {
+            GuardError::NotInitialized => Error::NotInitialized,
+            GuardError::InsufficientSignatures => Error::Unauthorized,
+            _ => Error::Unauthorized,
+        })
+    }
+
+    /// Read the factory's current pause state.
+    pub fn get_pause_state(env: Env) -> u32 {
+        EmergencyGuard::get_pause_state(env)
     }
 }
 

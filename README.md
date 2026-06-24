@@ -161,7 +161,7 @@ From the **repo root**:
   npm run lint
   ```
 
-(Add CI in `./.github/workflows` to automate these.)
+These checks run automatically on every push and pull request via the CI pipeline in `.github/workflows/ci.yml` (`cargo check`, `cargo fmt`, `cargo clippy`, `cargo test`, and frontend lint).
 
 ---
 

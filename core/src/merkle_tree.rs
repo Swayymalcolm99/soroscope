@@ -1,5 +1,12 @@
-use sha2::{Digest, Sha256};
+//! Merkle Tree implementation for SoroScope state commitments.
+//!
+//! Leaves are SHA-256 hashed to form leaf nodes. Internal nodes are produced by
+//! sorting each pair of child hashes (min || max) before concatenating and hashing,
+//! making proofs order-independent.
+
+use hex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// One step in a Merkle inclusion proof.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,7 +35,11 @@ pub struct MerkleProof {
 impl MerkleProof {
     /// Verify the proof against the claimed root.
     pub fn verify(&self) -> bool {
-        let mut current = self.leaf_hash;
+        let mut current = if self.leaf_hash == [0u8; 32] {
+            MerkleTree::hash_leaf(&self.leaf)
+        } else {
+            self.leaf_hash
+        };
 
         for node in &self.proof {
             current = if node.is_left {
@@ -72,15 +83,13 @@ impl MerkleTree {
     /// Build the tree from raw leaf bytes.
     pub fn build(&mut self, leaves: Vec<Vec<u8>>) -> Result<(), &'static str> {
         if leaves.is_empty() {
-            return Err("Cannot build tree from empty leaves.");
+            return Err("Cannot build a Merkle tree from zero leaves.");
         }
 
         let max_leaves = if self.levels >= 64 {
             usize::MAX
         } else {
-            1usize
-                .checked_shl(self.levels as u32)
-                .unwrap_or(usize::MAX)
+            1usize.checked_shl(self.levels as u32).unwrap_or(usize::MAX)
         };
 
         if leaves.len() > max_leaves {
@@ -146,7 +155,11 @@ impl MerkleTree {
 
     /// Verify a proof for the provided root.
     pub fn verify_proof(proof: &MerkleProof, root: &[u8; 32]) -> bool {
-        let mut current = proof.leaf_hash;
+        let mut current = if proof.leaf_hash == [0u8; 32] {
+            Self::hash_leaf(&proof.leaf)
+        } else {
+            proof.leaf_hash
+        };
 
         for node in &proof.proof {
             current = if node.is_left {
@@ -216,11 +229,7 @@ impl MerkleTree {
             let mut i = 0;
             while i < current_level.len() {
                 let left = &current_level[i];
-                let right = if i + 1 < current_level.len() {
-                    &current_level[i + 1]
-                } else {
-                    left
-                };
+                let right = if i + 1 < current_level.len() { &current_level[i + 1] } else { left };
                 next_level.push(Self::hash_pair(left, right));
                 i += 2;
             }
@@ -291,9 +300,7 @@ mod tests {
     #[test]
     fn test_generate_and_verify_proof_for_random_leaf_indexes() {
         let mut tree = MerkleTree::new(32);
-        let leaves: Vec<Vec<u8>> = (0..16)
-            .map(|i| format!("leaf-{i}").into_bytes())
-            .collect();
+        let leaves: Vec<Vec<u8>> = (0..16).map(|i| format!("leaf-{i}").into_bytes()).collect();
         tree.build(leaves).expect("tree builds");
 
         let mut seed = 12345u64;

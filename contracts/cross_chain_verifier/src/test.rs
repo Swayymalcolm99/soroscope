@@ -589,3 +589,150 @@ fn test_signer_removal_performance() {
 
     assert_eq!(client.get_signer_count(), 0);
 }
+
+// ============================================================================
+// PauseType::VERIFY Tests (#482)
+// ============================================================================
+
+/// Helper: build a valid one-node Merkle proof and return (client, block_height, leaf, proof, proof_flags).
+fn setup_valid_proof(
+    env: &Env,
+    client: &CrossChainVerifierClient,
+) -> (u32, BytesN<32>, soroban_sdk::Vec<BytesN<32>>, soroban_sdk::Vec<bool>) {
+    let leaf = BytesN::from_array(env, &[2u8; 32]);
+    let sibling = BytesN::from_array(env, &[3u8; 32]);
+
+    let mut combined = [0u8; 64];
+    combined[0..32].copy_from_slice(&sibling.to_array());
+    combined[32..64].copy_from_slice(&leaf.to_array());
+    let root_arr = env.crypto().sha256(&Bytes::from_slice(env, &combined)).to_array();
+    let root = BytesN::from_array(env, &root_arr);
+
+    let block_height: u32 = 42;
+    client.update_root(&block_height, &root);
+
+    let mut proof = soroban_sdk::Vec::new(env);
+    proof.push_back(sibling);
+    let mut flags = soroban_sdk::Vec::new(env);
+    flags.push_back(true);
+
+    (block_height, leaf, proof, flags)
+}
+
+#[test]
+fn test_is_paused_defaults_to_false() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_set_paused_and_is_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    client.set_paused(&true);
+    assert!(client.is_paused());
+
+    client.set_paused(&false);
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_verify_message_returns_false_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let (block_height, leaf, proof, flags) = setup_valid_proof(&env, &client);
+
+    // Verify succeeds before pause
+    assert!(client.verify_message(&block_height, &leaf, &proof, &flags));
+
+    // Pause and verify it now returns false
+    client.set_paused(&true);
+    assert!(!client.verify_message(&block_height, &leaf, &proof, &flags));
+}
+
+#[test]
+fn test_verify_message_succeeds_after_unpause() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let (block_height, leaf, proof, flags) = setup_valid_proof(&env, &client);
+
+    client.set_paused(&true);
+    assert!(!client.verify_message(&block_height, &leaf, &proof, &flags));
+
+    client.set_paused(&false);
+    assert!(client.verify_message(&block_height, &leaf, &proof, &flags));
+}
+
+#[test]
+#[should_panic(expected = "verification paused")]
+fn test_verify_message_and_consume_panics_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let (block_height, leaf, proof, flags) = setup_valid_proof(&env, &client);
+
+    client.set_paused(&true);
+    client.verify_message_and_consume(&block_height, &99u64, &leaf, &proof, &flags);
+}
+
+#[test]
+#[should_panic(expected = "verification paused")]
+fn test_verify_signed_message_panics_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    client.set_paused(&true);
+
+    let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+    let verifying_key = signing_key.verifying_key();
+    let public_key = Bytes::from_slice(&env, &verifying_key.to_bytes());
+    client.add_authorized_signer(&public_key, &SignatureAlgorithm::Ed25519);
+
+    let message = CrossChainMessage {
+        source_chain: 1,
+        destination_chain: 2,
+        nonce: 1,
+        payload: Bytes::from_slice(&env, b"payload"),
+        timestamp: 100,
+    };
+    let signature = signing_key.sign(b"anything");
+    let signed_message = SignedMessage {
+        message,
+        signature: BytesN::from_array(&env, &signature.to_bytes()),
+        signer_public_key: BytesN::from_array(&env, &verifying_key.to_bytes()),
+        algorithm: SignatureAlgorithm::Ed25519,
+    };
+
+    let proof = soroban_sdk::Vec::new(&env);
+    let flags = soroban_sdk::Vec::new(&env);
+    client.verify_signed_message(&signed_message, &100u32, &proof, &flags);
+}

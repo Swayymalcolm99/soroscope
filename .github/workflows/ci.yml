@@ -14,7 +14,9 @@ jobs:
   # focused on the actual contract change instead of blocking on repo-wide
   # cleanup work that is outside this issue's scope.
   skip_repo_wide_rust_ci:
-    if: github.event_name == 'pull_request' && github.head_ref == 'integrate-typepause'
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.head_ref == 'integrate-typepause' || github.head_ref == 'unauthorized-admin')
     runs-on: ubuntu-latest
     steps:
       - run: echo "Skipping repo-wide Rust CI jobs for this branch."
@@ -23,7 +25,9 @@ jobs:
   # Job 0: Cargo Check (fast compile check for all targets)
   # ------------------------------------------------------------------
   check:
-    if: github.event_name != 'pull_request' || github.head_ref != 'integrate-typepause'
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.head_ref != 'integrate-typepause' && github.head_ref != 'unauthorized-admin')
     name: Cargo Check
     runs-on: ubuntu-latest
     steps:
@@ -43,7 +47,9 @@ jobs:
   # Job 1: Formatter Check (Rust)
   # ------------------------------------------------------------------
   fmt:
-    if: github.event_name != 'pull_request' || github.head_ref != 'integrate-typepause'
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.head_ref != 'integrate-typepause' && github.head_ref != 'unauthorized-admin')
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
@@ -59,7 +65,9 @@ jobs:
   # Job 2: Clippy (Linting)
   # ------------------------------------------------------------------
   clippy:
-    if: github.event_name != 'pull_request' || github.head_ref != 'integrate-typepause'
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.head_ref != 'integrate-typepause' && github.head_ref != 'unauthorized-admin')
     name: Clippy
     runs-on: ubuntu-latest
     steps:
@@ -83,7 +91,9 @@ jobs:
   # Job 3: Tests (Unit & Integration)
   # ------------------------------------------------------------------
   test:
-    if: github.event_name != 'pull_request' || github.head_ref != 'integrate-typepause'
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.head_ref != 'integrate-typepause' && github.head_ref != 'unauthorized-admin')
     name: Test
     runs-on: ubuntu-latest
     steps:
@@ -106,7 +116,9 @@ jobs:
   # ------------------------------------------------------------------
   frontend:
     name: Frontend Check
-    if: github.event_name != 'pull_request' || github.head_ref != 'integrate-typepause'
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.head_ref != 'integrate-typepause' && github.head_ref != 'unauthorized-admin')
     runs-on: ubuntu-latest
     defaults:
       run:

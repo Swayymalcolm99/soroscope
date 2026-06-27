@@ -1694,7 +1694,7 @@ fn test_stake_insufficient_balance() {
     let shares = client.deposit(&user, &1000, &1000);
 
     // Try to stake more than available
-    assert!(client.stake(&user, &(shares + 1)).is_err());
+    assert!(client.try_stake(&user, &(shares + 1)).is_err());
 }
 
 #[test]
@@ -1809,7 +1809,7 @@ fn test_unstake_insufficient_staked() {
     client.stake(&user, &(shares / 2));
 
     // Try to unstake more than staked
-    assert!(client.unstake(&user, &shares).is_err());
+    assert!(client.try_unstake(&user, &shares).is_err());
 }
 
 #[test]

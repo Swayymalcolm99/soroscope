@@ -417,7 +417,7 @@ impl LiquidityPool {
     }
 
     pub fn get_pause_mask(e: Env) -> u32 {
-        guard_pause_state(&e).as_u32()
+        EmergencyGuard::get_pause_state(e)
     }
 
     /// Unpause all via multi-sig approvers (backward-compatible resume entry point).

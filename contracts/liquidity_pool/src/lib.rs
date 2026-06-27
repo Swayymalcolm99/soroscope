@@ -239,7 +239,7 @@ fn map_guard_err(err: GuardError) -> Error {
     }
 }
 
-fn require_not_paused(e: &Env, operation: u32) -> Result<(), Error> {
+fn check_not_paused(e: &Env, operation: u32) -> Result<(), Error> {
     if EmergencyGuard::is_paused(e.clone(), operation) {
         Err(Error::Paused)
     } else {
@@ -827,7 +827,7 @@ impl LiquidityPool {
     // ── Core AMM operations ───────────────────────────────────────────────────
 
     pub fn deposit(e: Env, to: Address, amount_a: i128, amount_b: i128) -> Result<i128, Error> {
-        require_not_paused(&e, PauseType::DEPOSIT)?;
+        check_not_paused(&e, PauseType::DEPOSIT)?;
         to.require_auth();
         let mut pool = load_pool(&e)?;
         let client_a = soroban_sdk::token::Client::new(&e, &pool.token_a);
@@ -879,7 +879,7 @@ impl LiquidityPool {
     }
 
     pub fn swap(e: Env, to: Address, buy_a: bool, out: i128, in_max: i128) -> Result<i128, Error> {
-        require_not_paused(&e, PauseType::SWAP)?;
+        check_not_paused(&e, PauseType::SWAP)?;
         to.require_auth();
         let mut pool = load_pool(&e)?;
         let (reserve_in, reserve_out, token_in, token_out) = if buy_a {
@@ -945,7 +945,7 @@ impl LiquidityPool {
     }
 
     pub fn withdraw(e: Env, to: Address, share_amount: i128) -> Result<(i128, i128), Error> {
-        require_not_paused(&e, PauseType::WITHDRAW)?;
+        check_not_paused(&e, PauseType::WITHDRAW)?;
         to.require_auth();
         let mut pool = load_pool(&e)?;
         let user_key = DataKey::Balance(to.clone());
@@ -995,7 +995,7 @@ impl LiquidityPool {
     }
 
     pub fn burn(e: Env, from: Address, amount: i128) -> Result<(), Error> {
-        require_not_paused(&e, PauseType::BURN)?;
+        check_not_paused(&e, PauseType::BURN)?;
         from.require_auth();
         let mut pool = load_pool(&e)?;
         let user_key = DataKey::Balance(from.clone());
@@ -1047,7 +1047,7 @@ impl LiquidityPool {
     }
 
     pub fn transfer(e: Env, from: Address, to: Address, amount: i128) -> Result<(), Error> {
-        require_not_paused(&e, PauseType::TRANSFER)?;
+        check_not_paused(&e, PauseType::TRANSFER)?;
         from.require_auth();
         let from_key = DataKey::Balance(from.clone());
         let to_key = DataKey::Balance(to);
@@ -1113,7 +1113,7 @@ impl LiquidityPool {
         to: Address,
         amount: i128,
     ) -> Result<(), Error> {
-        require_not_paused(&e, PauseType::TRANSFER)?;
+        check_not_paused(&e, PauseType::TRANSFER)?;
         spender.require_auth();
         let current_allowance = Self::allowance(e.clone(), from.clone(), spender.clone());
         if current_allowance < amount {

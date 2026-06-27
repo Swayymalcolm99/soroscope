@@ -1,7 +1,7 @@
 #![no_std]
 
 #[cfg(feature = "contract")]
-use soroban_sdk::{contract, contractimpl, contracttrait};
+use soroban_sdk::{contract, contractimpl};
 use soroban_sdk::{contracterror, contracttype, Address, Env, String, Vec};
 
 /// Granular pause types using bitmask for efficient storage
@@ -177,7 +177,6 @@ pub fn emit_admin_removed(e: &Env, approvers: &Vec<Address>, admin: &Address) {
     );
 }
 
-#[cfg_attr(feature = "contract", contracttrait)]
 pub trait EmergencyGuardTrait {
     fn rotate_admin(
         env: Env,

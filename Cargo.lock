@@ -539,6 +539,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "emergency_guard"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1378,6 +1385,7 @@ dependencies = [
 name = "soroban-staking-rewards"
 version = "0.1.0"
 dependencies = [
+ "emergency_guard",
  "soroban-sdk",
  "soroscope-error-codes",
  "soroscope-math",

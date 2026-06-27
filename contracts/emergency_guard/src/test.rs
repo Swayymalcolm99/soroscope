@@ -86,43 +86,32 @@ fn test_pause_all_and_unpause_all() {
 
 #[test]
 fn test_unpause_operation() {
-    let env = Env::default();
-    let mut pause_state = crate::PauseType::new(0);
-    pause_state.set_paused(crate::PauseType::SWAP, true);
-    env.storage().instance().set(&crate::DataKey::PauseState, &pause_state);
+    let (env, client, admins) = setup(1, 1);
+    let admin = admins[0].clone();
 
-    crate::DefaultEmergencyGuard::unpause(&env, crate::PauseType::SWAP)
-        .expect("Failed to unpause operation");
+    client.set_pause(&admin, &PauseType::SWAP, &true).unwrap();
+    assert!(client.is_paused(&PauseType::SWAP));
 
-    let state: crate::PauseType = env
-        .storage()
-        .instance()
-        .get(&crate::DataKey::PauseState)
-        .unwrap_or_else(|| crate::PauseType::new(0));
-    assert!(!state.is_paused(crate::PauseType::SWAP));
+    client.set_pause(&admin, &PauseType::SWAP, &false).unwrap();
+    assert!(!client.is_paused(&PauseType::SWAP));
 }
 
 #[test]
 fn test_unpause_all_operations() {
-    let env = Env::default();
-    let mut pause_state = crate::PauseType::new(0);
-    pause_state.pause_all();
-    env.storage().instance().set(&crate::DataKey::PauseState, &pause_state);
+    let (env, client, admins) = setup(1, 1);
+    let approvers = vec![&env, admins[0].clone()];
 
-    crate::DefaultEmergencyGuard::unpause_all(&env)
-        .expect("Failed to unpause all operations");
+    client.emergency_pause(&approvers).unwrap();
+    assert!(client.is_paused(&PauseType::SWAP));
+    assert!(client.is_paused(&PauseType::DEPOSIT));
 
-    let state: crate::PauseType = env
-        .storage()
-        .instance()
-        .get(&crate::DataKey::PauseState)
-        .unwrap_or_else(|| crate::PauseType::new(0));
-    assert!(!state.is_paused(crate::PauseType::SWAP));
-    assert!(!state.is_paused(crate::PauseType::DEPOSIT));
-    assert!(!state.is_paused(crate::PauseType::WITHDRAW));
-    assert!(!state.is_paused(crate::PauseType::TRANSFER));
-    assert!(!state.is_paused(crate::PauseType::MINT));
-    assert!(!state.is_paused(crate::PauseType::BURN));
+    client.resume(&approvers).unwrap();
+    assert!(!client.is_paused(&PauseType::SWAP));
+    assert!(!client.is_paused(&PauseType::DEPOSIT));
+    assert!(!client.is_paused(&PauseType::WITHDRAW));
+    assert!(!client.is_paused(&PauseType::TRANSFER));
+    assert!(!client.is_paused(&PauseType::MINT));
+    assert!(!client.is_paused(&PauseType::BURN));
 }
 
 #[test]

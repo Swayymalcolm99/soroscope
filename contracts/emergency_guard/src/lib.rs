@@ -1,8 +1,10 @@
 #![no_std]
 
+use soroban_sdk::{
+    contracterror, contracttype, Address, Env, String, Vec,
+};
 #[cfg(feature = "contract")]
 use soroban_sdk::{contract, contractimpl};
-use soroban_sdk::{contracterror, contracttype, Address, Env, String, Vec};
 
 /// Granular pause types using bitmask for efficient storage
 #[contracttype]
@@ -17,8 +19,6 @@ impl PauseType {
     pub const MINT: u32 = 1 << 4;
     pub const BURN: u32 = 1 << 5;
     pub const CREATE_PAIR: u32 = 1 << 6;
-    /// Pause claim operations
-    pub const CLAIM_REWARDS: u32 = 1 << 7;
 
     pub fn new(value: u32) -> Self {
         PauseType(value)
@@ -177,59 +177,8 @@ pub fn emit_admin_removed(e: &Env, approvers: &Vec<Address>, admin: &Address) {
     );
 }
 
-pub trait EmergencyGuardTrait {
-    fn rotate_admin(
-        env: Env,
-        approvers: Vec<Address>,
-        old_admin: Address,
-        new_admin: Address,
-    ) -> Result<(), GuardError>;
-}
-
 #[cfg_attr(feature = "contract", contract)]
 pub struct EmergencyGuard;
-
-#[cfg_attr(feature = "contract", contractimpl)]
-impl EmergencyGuardTrait for EmergencyGuard {
-    fn rotate_admin(
-        env: Env,
-        approvers: Vec<Address>,
-        old_admin: Address,
-        new_admin: Address,
-    ) -> Result<(), GuardError> {
-        EmergencyGuard::check_multi_sig(&env, &approvers)?;
-        let mut admins = EmergencyGuard::get_admins(env.clone());
-
-        let mut old_idx = None;
-        let mut new_exists = false;
-        let len = admins.len();
-
-        for i in 0..len {
-            let a = admins.get(i).unwrap();
-            if a == old_admin {
-                old_idx = Some(i);
-            }
-            if a == new_admin {
-                new_exists = true;
-            }
-        }
-
-        let idx = old_idx.ok_or(GuardError::AdminNotFound)?;
-
-        if new_exists {
-            admins.remove(idx);
-            let threshold = EmergencyGuard::get_threshold(env.clone());
-            if admins.len() < threshold {
-                return Err(GuardError::InvalidThreshold);
-            }
-        } else {
-            admins.set(idx, new_admin);
-        }
-
-        env.storage().instance().set(&GuardDataKey::Admins, &admins);
-        Ok(())
-    }
-}
 
 #[cfg_attr(feature = "contract", contractimpl)]
 impl EmergencyGuard {
@@ -365,7 +314,35 @@ impl EmergencyGuard {
         Ok(())
     }
 
-    // rotate_admin extracted to EmergencyGuardTrait
+    /// Rotate admin (multi-sig required).
+    pub fn rotate_admin(
+        env: Env,
+        approvers: Vec<Address>,
+        old_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), GuardError> {
+        Self::check_multi_sig(&env, &approvers)?;
+        let admins = Self::get_admins(env.clone());
+        let mut new_admins = Vec::new(&env);
+        let mut found = false;
+        for a in admins.iter() {
+            if a == old_admin {
+                found = true;
+                if !new_admins.iter().any(|x| x == new_admin) {
+                    new_admins.push_back(new_admin.clone());
+                }
+            } else if !new_admins.iter().any(|x| x == a) {
+                new_admins.push_back(a);
+            }
+        }
+        if !found {
+            return Err(GuardError::AdminNotFound);
+        }
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Admins, &new_admins);
+        Ok(())
+    }
 
     /// Get list of current admins.
     pub fn get_admins(env: Env) -> Vec<Address> {
@@ -406,7 +383,7 @@ impl EmergencyGuard {
 
     /// Verify that `approvers` contains at least `threshold` distinct valid admins,
     /// each having provided their authorization.
-    fn check_multi_sig(env: &Env, approvers: &Vec<Address>) -> Result<(), GuardError> {
+    pub(crate) fn check_multi_sig(env: &Env, approvers: &Vec<Address>) -> Result<(), GuardError> {
         let threshold: u32 = env
             .storage()
             .instance()
@@ -418,24 +395,16 @@ impl EmergencyGuard {
         }
 
         let mut valid = 0u32;
-        let len = approvers.len();
-        for i in 0..len {
-            let addr = approvers.get(i).unwrap();
-            if !Self::is_admin_internal(env, &addr) {
-                return Err(GuardError::Unauthorized);
-            }
-            let mut is_duplicate = false;
-            for j in 0..i {
-                if addr == approvers.get(j).unwrap() {
-                    is_duplicate = true;
-                    break;
-                }
-            }
-            if is_duplicate {
+        let mut seen = Vec::new(env);
+        for addr in approvers.iter() {
+            if seen.iter().any(|a| a == addr) {
                 continue;
             }
-            addr.require_auth();
-            valid += 1;
+            seen.push_back(addr.clone());
+            if Self::is_admin_internal(env, &addr) {
+                addr.require_auth();
+                valid += 1;
+            }
         }
 
         if valid < threshold {

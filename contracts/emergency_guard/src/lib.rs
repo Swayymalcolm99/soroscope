@@ -412,3 +412,7 @@ impl EmergencyGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod test;
+

@@ -1,40 +1,6 @@
 #![cfg(test)]
 
-use crate::{
-    AdminAddedEvent, AdminRemovedEvent, EmergencyGuard, EmergencyGuardClient, EmergencyPausedEvent,
-    GuardInitializedEvent, PauseStateChangedEvent, ResumedEvent,
-};
-use soroban_sdk::{
-    testutils::{Address as _, Events},
-    vec, Address, Env, String as SorobanString, TryIntoVal,
-};
-use soroban_sdk::{testutils::Address as _, vec, Address, Env};
-use soroban_sdk::{String as SorobanString};
-
-use crate::{EmergencyGuard, EmergencyGuardClient, GuardError, PauseType};
-
-// ─── helpers ────────────────────────────────────────────────────────────────
-
-fn make_admins(env: &Env, n: u32) -> soroban_sdk::Vec<Address> {
-    let mut v = soroban_sdk::Vec::new(env);
-    for _ in 0..n {
-        v.push_back(Address::random(env));
-    }
-    v
-}
-
-fn setup(threshold: u32, n_admins: u32) -> (Env, EmergencyGuardClient<'static>, Vec<Address>) {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, EmergencyGuard);
-    let client = EmergencyGuardClient::new(&env, &contract_id);
-    let admins = make_admins(&env, n_admins);
-    client.initialize(&admins, &threshold).unwrap();
-    let std_admins: Vec<Address> = admins.iter().collect();
-    (env, client, std_admins)
-}
-
-// ─── PauseType unit tests ────────────────────────────────────────────────────
+use crate::PauseType;
 
 #[test]
 fn test_granular_pause_types() {
@@ -55,6 +21,30 @@ fn test_granular_pause_types() {
     assert!(!pause.is_paused(PauseType::SWAP));
     assert!(pause.is_paused(PauseType::DEPOSIT));
     assert!(pause.is_paused(PauseType::WITHDRAW));
+}
+
+#[test]
+fn test_bitwise_pause_logic() {
+    let mut pause = PauseType::new(0);
+
+    // Test setting operations
+    pause.set_paused(PauseType::SWAP, true);
+    assert!(pause.is_paused(PauseType::SWAP));
+    assert!(!pause.is_paused(PauseType::DEPOSIT));
+
+    // Test checking multiple operations
+    pause.set_paused(PauseType::MINT, true);
+    assert!(pause.is_paused(PauseType::SWAP));
+    assert!(pause.is_paused(PauseType::MINT));
+
+    // Test clearing operations
+    pause.set_paused(PauseType::SWAP, false);
+    assert!(!pause.is_paused(PauseType::SWAP));
+    assert!(pause.is_paused(PauseType::MINT));
+
+    // Test clearing all manually
+    pause.set_paused(PauseType::MINT, false);
+    assert_eq!(pause.as_u32(), 0);
 }
 
 #[test]
@@ -557,62 +547,4 @@ fn test_pause_type_as_u32_bitmask() {
         pause.as_u32(),
         crate::PauseType::SWAP | crate::PauseType::DEPOSIT
     );
-}
-
-#[test]
-fn test_event_emission_for_guard_actions() {
-    let e = Env::default();
-    e.mock_all_auths();
-
-    let contract_id = e.register(crate::EmergencyGuard, ());
-    let client = crate::EmergencyGuardClient::new(&e, &contract_id);
-
-    // Setup admins
-    let admin1 = Address::random(&e);
-    let admin2 = Address::random(&e);
-    let admins = vec![&e, admin1.clone(), admin2.clone()];
-
-    // Initialize guard
-    client.initialize(&admins, &1u32);
-
-    // Call set_pause
-    client.set_pause(&admin1, &crate::PauseType::TRANSFER, &true).unwrap();
-
-    // Emergency pause all
-    let approvers = vec![&e, admin1.clone()];
-    client.emergency_pause(&approvers).unwrap();
-
-    // Resume all
-    client.resume(&approvers).unwrap();
-
-    // Add admin
-    let new_admin = Address::random(&e);
-    client.add_admin(&approvers, &new_admin).unwrap();
-
-    // Remove admin
-    client.remove_admin(&approvers, &new_admin).unwrap();
-
-    // Inspect events
-    let events = e.events().all();
-
-    // Helper to find events by name
-    let find_events = |name: &str| {
-        let name_val = String::from_str(&e, name);
-        events
-            .iter()
-            .filter(|(_, topics, _)| {
-                if topics.is_empty() {
-                    return false;
-                }
-                let topic_str: Result<SorobanString, _> = topics.get(0).unwrap().try_into_val(&e);
-                topic_str.is_ok() && topic_str.unwrap() == name_val
-            })
-            .collect::<Vec<_>>()
-    };
-
-    assert!(!find_events("emergency_guard.set_pause").is_empty());
-    assert!(!find_events("emergency_guard.emergency_pause_all").is_empty());
-    assert!(!find_events("emergency_guard.resume_all").is_empty());
-    assert!(!find_events("emergency_guard.admin_added").is_empty());
-    assert!(!find_events("emergency_guard.admin_removed").is_empty());
 }

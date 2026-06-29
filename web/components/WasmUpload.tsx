@@ -49,7 +49,7 @@ export default function WasmUpload({
   maxFiles = 5,
   className,
 }: WasmUploadProps) {
-  const [files, setFiles] = useState<<WasmFile[]>([]);
+  const [files, setFiles] = useState<WasmFile[]>([]);
   const [isDragActive, setIsDragActive] = useState(false);
 
   //validate WASM file
@@ -152,7 +152,7 @@ export default function WasmUpload({
       //auto-upload valid files
       validFiles.forEach((f) => uploadFile(f));
     },
-    [files, maxFiles, onFileSelect]
+    [files, maxFiles, onFileSelect, uploadFile, validateWasm]
   );
 
   const { getRootProps, getInputProps, isDragReject } = useDropzone({
@@ -196,7 +196,7 @@ export default function WasmUpload({
     <div className={cn("w-full max-w-2xl mx-auto", className)}>
       {/*drop Zone*/}
       <motion.div
-        {...getRootProps()}
+        {...(getRootProps() as any)}
         className={cn(
           "relative border-2 border-dashed rounded-2xl p-8 text-center cursor-pointer transition-colors duration-200",
           isDragActive

@@ -195,4 +195,24 @@ fn test_multiple_users_independent_nonces() {
 
     assert_eq!(ctx.client().nonce(&ctx.alice), 1);
     assert_eq!(ctx.client().nonce(&ctx.bob), 1);
+
+    // Replay of nonce 0 must still revert.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().execute(&ctx.relayer, &ctx.meta_tx(0));
+    }));
+    assert!(result.is_err(), "replay with consumed nonce must revert");
+}
+
+#[test]
+fn test_execute_emits_event() {
+    let ctx = Ctx::setup();
+    ctx.env.mock_all_auths();
+    ctx.client().execute(&ctx.relayer, &ctx.meta_tx(0));
+
+    let events = ctx.env.events().all();
+    let has_executed = events.iter().any(|(_, topics, _)| {
+        topics.len() == 1
+            && topics.get(0) == Some(Symbol::new(&ctx.env, "executed").into_val(&ctx.env))
+    });
+    assert!(has_executed, "expected 'executed' event");
 }

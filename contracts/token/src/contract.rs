@@ -173,6 +173,9 @@ impl TokenTrait for Token {
         e.storage()
             .instance()
             .set(&GuardDataKey::Admins, &rotated_admins);
+        // Use EmergencyGuard multi-sig to rotate the guard admin list, then update token admin.
+        EmergencyGuard::rotate_admin(e.clone(), vec![&e, admin.clone()], admin, new_admin.clone())
+            .expect("failed to rotate admin via EmergencyGuard");
         write_administrator(&e, &new_admin);
     }
 
